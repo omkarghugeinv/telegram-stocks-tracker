@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 import os
 import time
 from datetime import datetime
@@ -37,8 +38,7 @@ DEFAULT_STATE = {
     "gst_pct": DEFAULT_GST_PCT,
     "extra_fee_pct": DEFAULT_EXTRA_FEE_PCT,
     "alerts_enabled": True,
-    "last_alert_price": None,
-    "breakeven_triggered": False,
+    "last_be_step": None,
 }
 
 YF_TICKER = yf.Ticker(TICKER)
@@ -105,7 +105,6 @@ def fetch_yahoo_price() -> float:
 
 
 def fetch_price_for_session(session: str) -> tuple[float, str]:
-    """Uses Finnhub during regular hours and Yahoo Finance during extended/closed hours."""
     if session == "regular":
         try:
             return fetch_finnhub_price(TICKER), "Finnhub"
@@ -154,6 +153,8 @@ def calculate_metrics(price: float, state: dict) -> dict:
     else:
         true_be = 0.0
 
+    pct_from_be = ((price - true_be) / true_be) * 100.0 if true_be > 0 else 0.0
+
     return {
         "invested": invested,
         "current_val": current_val,
@@ -165,42 +166,65 @@ def calculate_metrics(price: float, state: dict) -> dict:
         "net_pnl": net_pnl,
         "net_pnl_pct": net_pnl_pct,
         "true_be": true_be,
+        "pct_from_be": pct_from_be,
         "to_pure_profit": true_be - price,
     }
+
+
+def step_price(true_be: float, step: int) -> float:
+    return true_be * (1.0 + (step * MOVE_PCT) / 100.0)
+
+
+def step_label(step: int) -> str:
+    if step == 0:
+        return "0% BE"
+    return f"{step * MOVE_PCT:+g}%"
 
 
 def format_report(price: float, state: dict, source: str) -> str:
     m = calculate_metrics(price, state)
     avg = state["avg_price"]
+    true_be = m["true_be"]
     icon = "🟢" if m["net_pnl"] >= 0 else "🔴"
-
     brok_total = m["buy_brok"] + m["sell_brok"]
-    anchor = state.get("last_alert_price")
-    anchor_line = f"\n• Alert Anchor: `${anchor:.2f}` (`±{MOVE_PCT:g}%`)" if anchor else ""
+
+    last_step = state.get("last_be_step")
+    if last_step is not None and true_be > 0:
+        down_step = last_step - 1
+        up_step = last_step + 1
+        next_line = (
+            f"\n• Next Triggers: "
+            f"📉 `${step_price(true_be, down_step):.2f}` (`{step_label(down_step)}`) | "
+            f"📈 `${step_price(true_be, up_step):.2f}` (`{step_label(up_step)}`)"
+        )
+    else:
+        next_line = ""
 
     return (
         f"{icon} *{TICKER} Position* ({source})\n"
         f"• Price: `${price:.2f}` (Avg: `${avg:.2f}`)\n"
-        f"• True Breakeven: `${m['true_be']:.2f}`\n"
+        f"• True Breakeven: `${true_be:.2f}` (`{m['pct_from_be']:+.2f}%` from BE)\n"
         f"• Value: `${m['current_val']:.2f}` / `${m['invested']:.2f}`\n"
         f"• Net P&L: `${m['net_pnl']:+.2f}` (`{m['net_pnl_pct']:+.2f}%`)\n"
         f"• Gross P&L: `${m['gross_pnl']:+.2f}`\n"
         f"• Charges: `${m['total_charges']:.2f}` "
         f"(Brok+GST `${brok_total:.2f}` + Fees `${m['extra_fee']:.2f}`)\n"
         f"• To Pure Profit: `${m['to_pure_profit']:+.2f}`/share"
-        f"{anchor_line}"
+        f"{next_line}"
     )
 
 
 def format_breakeven_summary(state: dict) -> str:
     m = calculate_metrics(state["avg_price"], state)
+    true_be = m["true_be"]
     return (
         f"• Shares: `{state['shares']:.8f}`\n"
         f"• Raw Avg: `${state['avg_price']:.2f}`\n"
         f"• Brokerage: `{state['brokerage_pct']:g}%`/side + `{state['gst_pct']:g}%` GST "
         f"(`${m['buy_brok'] + m['sell_brok']:.2f}`)\n"
         f"• Extra Fees: `{state['extra_fee_pct']:g}%` (`${m['extra_fee']:.2f}`)\n"
-        f"• *True Breakeven:* `${m['true_be']:.2f}` (pure profit above this)"
+        f"• *True Breakeven (0%):* `${true_be:.2f}`\n"
+        f"• Grid Example: `-1%` `${step_price(true_be, -1):.2f}` | `+1%` `${step_price(true_be, 1):.2f}`"
     )
 
 
@@ -230,9 +254,7 @@ async def avg_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         avg_price = float(context.args[0])
         state = load_state()
         state["avg_price"] = avg_price
-        true_be = calculate_metrics(avg_price, state)["true_be"]
-        anchor = state.get("last_alert_price")
-        state["breakeven_triggered"] = (anchor >= true_be) if anchor is not None else False
+        state["last_be_step"] = None
         save_state(state)
         await update.message.reply_text(
             f"✅ *Average Price Updated*\n{format_breakeven_summary(state)}",
@@ -255,9 +277,7 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         state = load_state()
         state["shares"] = shares
         state["avg_price"] = avg_price
-        true_be = calculate_metrics(avg_price, state)["true_be"]
-        anchor = state.get("last_alert_price")
-        state["breakeven_triggered"] = (anchor >= true_be) if anchor is not None else False
+        state["last_be_step"] = None
         save_state(state)
         await update.message.reply_text(
             f"✅ *Position Updated*\n{format_breakeven_summary(state)}",
@@ -283,14 +303,11 @@ async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         new_avg = (old_cost + usd_spent) / new_shares
         state["shares"] = new_shares
         state["avg_price"] = new_avg
-        true_be = calculate_metrics(buy_price, state)["true_be"]
-        state["last_alert_price"] = buy_price
-        state["breakeven_triggered"] = buy_price >= true_be
+        state["last_be_step"] = None
         save_state(state)
         await update.message.reply_text(
             f"✅ *Added `${usd_spent:.2f}` @ `${buy_price:.2f}`*\n"
-            f"{format_breakeven_summary(state)}\n"
-            f"• Alert Anchor reset to `${buy_price:.2f}`",
+            f"{format_breakeven_summary(state)}",
             parse_mode="Markdown",
         )
     except (IndexError, ValueError, ZeroDivisionError):
@@ -310,9 +327,7 @@ async def fees_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         state = load_state()
         state["brokerage_pct"] = brok_pct
         state["extra_fee_pct"] = extra_pct
-        true_be = calculate_metrics(state["avg_price"], state)["true_be"]
-        anchor = state.get("last_alert_price")
-        state["breakeven_triggered"] = (anchor >= true_be) if anchor is not None else False
+        state["last_be_step"] = None
         save_state(state)
         await update.message.reply_text(
             f"✅ *Charge Rates Updated*\n{format_breakeven_summary(state)}",
@@ -373,51 +388,55 @@ async def scheduled_check(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     m = calculate_metrics(price, state)
     true_be = m["true_be"]
-    anchor = state.get("last_alert_price")
-    breakeven_triggered = state.get("breakeven_triggered", False)
+    pct_from_be = m["pct_from_be"]
+    last_step = state.get("last_be_step")
 
-    if anchor is None:
-        state["last_alert_price"] = price
-        state["breakeven_triggered"] = price >= true_be
+    # First run (or right after /avg, /set, /buy, /fees): lock onto nearest breakeven grid step
+    if last_step is None:
+        current_step = int(round(pct_from_be / MOVE_PCT))
+        state["last_be_step"] = current_step
         save_state(state)
+        down_step = current_step - 1
+        up_step = current_step + 1
         await context.bot.send_message(
             chat_id=CHAT_ID,
             text=(
-                f"📌 *{TICKER} Tracker Armed* ({source})\n"
-                f"• Baseline: `${price:.2f}`\n"
-                f"• Alerts: `±{MOVE_PCT:g}%` move or pure profit (`${true_be:.2f}`)"
+                f"📌 *{TICKER} Breakeven Grid Armed* ({source})\n"
+                f"• Price: `${price:.2f}` (`{pct_from_be:+.2f}%` from `${true_be:.2f}` BE)\n"
+                f"• Next Down Alert: `${step_price(true_be, down_step):.2f}` (`{step_label(down_step)}`)\n"
+                f"• Next Up Alert: `${step_price(true_be, up_step):.2f}` (`{step_label(up_step)}`)"
             ),
             parse_mode="Markdown",
         )
         return
 
-    reasons = []
-    state_changed = False
-    move_pct = ((price - anchor) / anchor) * 100.0 if anchor > 0 else 0.0
+    eps = 1e-9
+    new_step = None
+    if pct_from_be >= (last_step + 1) * MOVE_PCT - eps:
+        new_step = math.floor((pct_from_be + eps) / MOVE_PCT)
+    elif pct_from_be <= (last_step - 1) * MOVE_PCT + eps:
+        new_step = math.ceil((pct_from_be - eps) / MOVE_PCT)
 
-    if abs(move_pct) >= MOVE_PCT:
-        arrow = "📈" if move_pct > 0 else "📉"
-        reasons.append(f"{arrow} Moved `{move_pct:+.2f}%` (from `${anchor:.2f}`)")
-
-    if price >= true_be and not breakeven_triggered:
-        reasons.append(f"🎯 Pure profit zone reached (`${true_be:.2f}` after brokerage & fees)")
-        state["breakeven_triggered"] = True
-        state_changed = True
-    elif price < true_be * 0.995 and breakeven_triggered:
-        state["breakeven_triggered"] = False
-        state_changed = True
-
-    if reasons:
-        state["last_alert_price"] = price
+    if new_step is not None and new_step != last_step:
+        direction = "up" if new_step > last_step else "down"
+        state["last_be_step"] = new_step
         save_state(state)
-        header = "\n".join(reasons)
+
+        if new_step == 0:
+            if direction == "up":
+                header = f"🎯 *True Breakeven Reached* (`0%` @ `${true_be:.2f}`)"
+            else:
+                header = f"⚠️ *Back to True Breakeven* (`0%` @ `${true_be:.2f}`)"
+        elif direction == "up":
+            header = f"📈 *Crossed `{step_label(new_step)}` from Breakeven* (now `{pct_from_be:+.2f}%`)"
+        else:
+            header = f"📉 *Dropped to `{step_label(new_step)}` from Breakeven* (now `{pct_from_be:+.2f}%`)"
+
         await context.bot.send_message(
             chat_id=CHAT_ID,
             text=f"{header}\n\n{format_report(price, state, source)}",
             parse_mode="Markdown",
         )
-    elif state_changed:
-        save_state(state)
 
 
 def main() -> None:
@@ -429,11 +448,11 @@ def main() -> None:
     app.add_handler(CommandHandler("fees", fees_cmd))
     app.add_handler(CommandHandler("toggle", toggle_cmd))
 
-    # Master loop ticks every 60s; internal timers enforce REGULAR_MINUTES vs EXTENDED_MINUTES
     app.job_queue.run_repeating(scheduled_check, interval=60, first=10)
     print(
         f"{TICKER} hybrid bot started "
-        f"(Finnhub every {REGULAR_MINUTES}m regular | Yahoo every {EXTENDED_MINUTES}m extended)..."
+        f"(Finnhub every {REGULAR_MINUTES}m regular | Yahoo every {EXTENDED_MINUTES}m extended | "
+        f"grid ±{MOVE_PCT:g}% from True BE)..."
     )
     app.run_polling()
 
