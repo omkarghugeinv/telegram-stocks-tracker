@@ -1,4 +1,5 @@
 import asyncio
+import html
 import json
 import math
 import os
@@ -8,8 +9,9 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 import requests
 import yfinance as yf
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = int(os.environ["CHAT_ID"])
@@ -145,7 +147,7 @@ def parse_pct(raw: str, label: str, max_val: float = 100.0, allow_max: bool = Fa
     val = float(raw)
     too_high = (val > max_val) if allow_max else (val >= max_val)
     if not math.isfinite(val) or val < 0 or too_high:
-        bound = f"0–{max_val:g}%" if allow_max else f"0 to <{max_val:g}%"
+        bound = f"0–{max_val:g}%" if allow_max else f"0 to &lt;{max_val:g}%"
         raise ValueError(f"{label} must be within {bound}.")
     return val
 
@@ -279,40 +281,73 @@ def step_label(step: int) -> str:
     return "0% BE" if step == 0 else f"{step * MOVE_PCT:+g}%"
 
 
+def build_status_keyboard(state: dict) -> InlineKeyboardMarkup:
+    alert_btn = "🔔 Alerts: ON" if state.get("alerts_enabled", True) else "🔕 Paused"
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data="refresh"),
+            InlineKeyboardButton(alert_btn, callback_data="toggle_status"),
+            InlineKeyboardButton("⚙️ Commands", callback_data="help"),
+        ]
+    ])
+
+
+def build_help_keyboard(state: dict) -> InlineKeyboardMarkup:
+    alert_btn = "🔔 Alerts: ON" if state.get("alerts_enabled", True) else "🔕 Paused"
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⬅️ Live Status", callback_data="refresh"),
+            InlineKeyboardButton(alert_btn, callback_data="toggle_help"),
+        ]
+    ])
+
+
 def format_report(
-    price: float, quote_dt: datetime, state: dict, source: str, compact: bool = False
+    price: float,
+    quote_dt: datetime,
+    state: dict,
+    source: str,
+    compact: bool = False,
+    header: str | None = None,
 ) -> str:
     m = calculate_metrics(price, state)
     true_be = m["true_be"]
     icon = "🟢" if m["net_pnl"] >= 0 else "🔴"
     net_str = fmt_signed_usd(m["net_pnl"])
+    safe_source = html.escape(source)
 
     last_step = state.get("last_be_step")
     if last_step is not None and true_be > 0:
         down_p = step_price(true_be, last_step - 1)
         up_p = step_price(true_be, last_step + 1)
-        next_short = f" • Next: `${down_p:.2f}` / `${up_p:.2f}`"
-        next_full = (
-            f" • Next: 📉 `${down_p:.2f}` (`{step_label(last_step - 1)}`) | "
-            f"📈 `${up_p:.2f}` (`{step_label(last_step + 1)}`)"
+        next_short = f" • Next: <code>${down_p:.2f}</code> / <code>${up_p:.2f}</code>"
+        next_line = (
+            f"\n📉 <code>${down_p:.2f}</code> (<code>{step_label(last_step - 1)}</code>)  |  "
+            f"📈 <code>${up_p:.2f}</code> (<code>{step_label(last_step + 1)}</code>)"
         )
     else:
         next_short = ""
-        next_full = ""
+        next_line = ""
 
     if compact:
+        title = f"{header}\n" if header else ""
         return (
-            f"{icon} *{TICKER}* `${price:.2f}` (`{m['pct_from_be']:+.2f}%` vs BE)\n"
-            f"Net P&L: `{net_str}` (`{m['net_pnl_pct']:+.2f}%`)\n"
-            f"BE: `${true_be:.2f}`{next_short}"
+            f"{title}"
+            f"<blockquote>{icon} <b>{TICKER}</b>  <code>${price:.2f}</code>  "
+            f"(<code>{m['pct_from_be']:+.2f}%</code> vs BE)\n"
+            f"<b>Net P&amp;L:</b> <code>{net_str}</code> (<code>{m['net_pnl_pct']:+.2f}%</code>)\n"
+            f"<b>BE:</b> <code>${true_be:.2f}</code>{next_short}</blockquote>"
         )
 
-    ts_str = quote_dt.strftime("%b %d %H:%M ET")
+    ts_str = quote_dt.strftime("%b %d, %H:%M ET")
     return (
-        f"{icon} *{TICKER}* `${price:.2f}` (`{ts_str}` • {source})\n"
-        f"Net P&L: `{net_str}` (`{m['net_pnl_pct']:+.2f}%`) • Val: `${m['current_val']:.2f}`\n"
-        f"True BE: `${true_be:.2f}` (`{m['pct_from_be']:+.2f}%` | Avg `${state['avg_price']:.2f}`)\n"
-        f"Fees: `${m['total_charges']:.2f}`{next_full}"
+        f"{icon} <b>{TICKER}</b>  <code>${price:.2f}</code>\n"
+        f"<i>{ts_str} • {safe_source}</i>\n"
+        f"<blockquote><b>Net P&amp;L:</b> <code>{net_str}</code> (<code>{m['net_pnl_pct']:+.2f}%</code>)\n"
+        f"<b>Value:</b> <code>${m['current_val']:.2f}</code> / <code>${m['invested']:.2f}</code>\n"
+        f"<b>True BE:</b> <code>${true_be:.2f}</code> (<code>{m['pct_from_be']:+.2f}%</code> • Avg <code>${state['avg_price']:.2f}</code>)\n"
+        f"<b>Fees:</b> <code>${m['total_charges']:.2f}</code></blockquote>"
+        f"{next_line}"
     )
 
 
@@ -320,11 +355,31 @@ def format_breakeven_summary(state: dict) -> str:
     m = calculate_metrics(state["avg_price"], state)
     true_be = m["true_be"]
     return (
-        f"• Shares: `{state['shares']:.8f}` | Avg: `${state['avg_price']:.2f}`\n"
-        f"• Fees: `${m['total_charges']:.2f}` "
-        f"(`{state['brokerage_pct']:g}%`+{state['gst_pct']:g}% GST, `{state['extra_fee_pct']:g}%` extra)\n"
-        f"• *True BE:* `${true_be:.2f}` "
-        f"(`-1%` `${step_price(true_be, -1):.2f}` | `+1%` `${step_price(true_be, 1):.2f}`)"
+        f"<blockquote><b>Shares:</b> <code>{state['shares']:.8f}</code>  |  "
+        f"<b>Avg:</b> <code>${state['avg_price']:.2f}</code>\n"
+        f"<b>Fees:</b> <code>${m['total_charges']:.2f}</code> "
+        f"(<code>{state['brokerage_pct']:g}%</code> + <code>{state['gst_pct']:g}%</code> GST, "
+        f"<code>{state['extra_fee_pct']:g}%</code> extra)\n"
+        f"<b>True BE:</b> <code>${true_be:.2f}</code> "
+        f"(<code>-1%</code> <code>${step_price(true_be, -1):.2f}</code> | "
+        f"<code>+1%</code> <code>${step_price(true_be, 1):.2f}</code>)</blockquote>"
+    )
+
+
+def format_help(state: dict) -> str:
+    m = calculate_metrics(state["avg_price"], state)
+    return (
+        f"⚙️ <b>{TICKER} Tracker Settings &amp; Commands</b>\n"
+        f"<blockquote><b>Shares:</b> <code>{state['shares']:.8f}</code>  |  <b>Avg:</b> <code>${state['avg_price']:.2f}</code>\n"
+        f"<b>True BE:</b> <code>${m['true_be']:.2f}</code>  |  <b>Grid:</b> <code>±{MOVE_PCT:g}%</code>\n"
+        f"<b>Charges:</b> <code>{state['brokerage_pct']:g}%</code>/side + <code>{state['gst_pct']:g}%</code> GST + <code>{state['extra_fee_pct']:g}%</code> extra</blockquote>\n"
+        f"<b>Tap any example to copy:</b>\n"
+        f"• <code>/status</code> — Live price, P&amp;L &amp; triggers\n"
+        f"• <code>/avg {state['avg_price']:.2f}</code> — Update average price\n"
+        f"• <code>/buy 50 42.00</code> — Log a new buy (USD &amp; price)\n"
+        f"• <code>/set {state['shares']:.4f} {state['avg_price']:.2f}</code> — Set shares &amp; avg\n"
+        f"• <code>/fees {state['brokerage_pct']:g} {state['extra_fee_pct']:g} {state['gst_pct']:g}</code> — Update brok / extra / GST %\n"
+        f"• <code>/toggle</code> — Pause or resume alerts"
     )
 
 
@@ -336,43 +391,55 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not is_authorized(update):
         return
     try:
+        state = load_state()
         session = await asyncio.to_thread(get_market_session)
         price, quote_dt, source = await asyncio.to_thread(fetch_quote_for_session, session)
         await update.message.reply_text(
-            format_report(price, quote_dt, load_state(), source, compact=False),
-            parse_mode="Markdown",
+            format_report(price, quote_dt, state, source, compact=False),
+            parse_mode="HTML",
+            reply_markup=build_status_keyboard(state),
         )
     except Exception as e:
-        await update.message.reply_text(f"Error fetching price: {e}")
+        await update.message.reply_text(f"Error fetching price: {html.escape(str(e))}")
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update):
+        return
+    state = load_state()
+    await update.message.reply_text(
+        format_help(state),
+        parse_mode="HTML",
+        reply_markup=build_help_keyboard(state),
+    )
 
 
 async def avg_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Usage: /avg <avg_price>"""
     if not is_authorized(update):
         return
     try:
         if len(context.args) != 1:
-            raise ValueError("Usage: `/avg <avg_price>`\nExample: `/avg 45.82`")
+            raise ValueError("Usage: <code>/avg 45.82</code>")
         avg_price = parse_positive(context.args[0], "Average price")
         state = load_state()
         state["avg_price"] = avg_price
         state["last_be_step"] = None
         save_state(state)
         await update.message.reply_text(
-            f"✅ *Average Updated*\n{format_breakeven_summary(state)}",
-            parse_mode="Markdown",
+            f"✅ <b>Average Updated</b>\n{format_breakeven_summary(state)}",
+            parse_mode="HTML",
+            reply_markup=build_status_keyboard(state),
         )
     except ValueError as e:
-        await update.message.reply_text(str(e), parse_mode="Markdown")
+        await update.message.reply_text(str(e), parse_mode="HTML")
 
 
 async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Usage: /set <shares> <avg_price>"""
     if not is_authorized(update):
         return
     try:
         if len(context.args) != 2:
-            raise ValueError("Usage: `/set <shares> <avg_price>`\nExample: `/set 13.32899018 45.82`")
+            raise ValueError("Usage: <code>/set 13.32899018 45.82</code>")
         shares = parse_positive(context.args[0], "Shares")
         avg_price = parse_positive(context.args[1], "Average price")
         state = load_state()
@@ -381,20 +448,20 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         state["last_be_step"] = None
         save_state(state)
         await update.message.reply_text(
-            f"✅ *Position Updated*\n{format_breakeven_summary(state)}",
-            parse_mode="Markdown",
+            f"✅ <b>Position Updated</b>\n{format_breakeven_summary(state)}",
+            parse_mode="HTML",
+            reply_markup=build_status_keyboard(state),
         )
     except ValueError as e:
-        await update.message.reply_text(str(e), parse_mode="Markdown")
+        await update.message.reply_text(str(e), parse_mode="HTML")
 
 
 async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Usage: /buy <usd_spent> <buy_price>"""
     if not is_authorized(update):
         return
     try:
         if len(context.args) != 2:
-            raise ValueError("Usage: `/buy <usd_spent> <buy_price>`\nExample: `/buy 50 42.00`")
+            raise ValueError("Usage: <code>/buy 50 42.00</code>")
         usd_spent = parse_positive(context.args[0], "USD spent")
         buy_price = parse_positive(context.args[1], "Buy price")
         state = load_state()
@@ -406,24 +473,24 @@ async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         state["last_be_step"] = None
         save_state(state)
         await update.message.reply_text(
-            f"✅ *Added `${usd_spent:.2f}` @ `${buy_price:.2f}`*\n"
+            f"✅ <b>Added <code>${usd_spent:.2f}</code> @ <code>${buy_price:.2f}</code></b>\n"
             f"{format_breakeven_summary(state)}",
-            parse_mode="Markdown",
+            parse_mode="HTML",
+            reply_markup=build_status_keyboard(state),
         )
     except ValueError as e:
-        await update.message.reply_text(str(e), parse_mode="Markdown")
+        await update.message.reply_text(str(e), parse_mode="HTML")
 
 
 async def fees_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Usage: /fees <brokerage_per_side_%> <extra_fee_%> [gst_%]"""
     if not is_authorized(update):
         return
     try:
         if len(context.args) not in (2, 3):
             raise ValueError(
-                "Usage: `/fees <brokerage_%> <extra_fee_%> [gst_%]`\n"
-                "• Standard (`0.25%`/side + `0.70%` fees + `18%` GST): `/fees 0.25 0.70 18`\n"
-                "• All-in `0.70%` only: `/fees 0 0.70 0`"
+                "Usage: <code>/fees &lt;brok_%&gt; &lt;extra_%&gt; [gst_%]</code>\n"
+                "• Standard: <code>/fees 0.25 0.70 18</code>\n"
+                "• All-in 0.70%: <code>/fees 0 0.70 0</code>"
             )
         state = load_state()
         brok_pct = parse_pct(context.args[0], "Brokerage %", max_val=50.0)
@@ -442,11 +509,12 @@ async def fees_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         state["last_be_step"] = None
         save_state(state)
         await update.message.reply_text(
-            f"✅ *Charge Rates Updated*\n{format_breakeven_summary(state)}",
-            parse_mode="Markdown",
+            f"✅ <b>Charge Rates Updated</b>\n{format_breakeven_summary(state)}",
+            parse_mode="HTML",
+            reply_markup=build_status_keyboard(state),
         )
     except ValueError as e:
-        await update.message.reply_text(str(e), parse_mode="Markdown")
+        await update.message.reply_text(str(e), parse_mode="HTML")
 
 
 async def toggle_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -455,8 +523,60 @@ async def toggle_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     state = load_state()
     state["alerts_enabled"] = not state.get("alerts_enabled", True)
     save_state(state)
-    label = "ON" if state["alerts_enabled"] else "PAUSED"
-    await update.message.reply_text(f"Trigger alerts are now *{label}*.", parse_mode="Markdown")
+    label = "ON 🔔" if state["alerts_enabled"] else "PAUSED 🔕"
+    await update.message.reply_text(
+        f"Trigger alerts are now <b>{label}</b>.",
+        parse_mode="HTML",
+        reply_markup=build_status_keyboard(state),
+    )
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update):
+        return
+    query = update.callback_query
+    action = query.data
+
+    if action == "refresh":
+        await query.answer("Updating price...")
+        try:
+            state = load_state()
+            session = await asyncio.to_thread(get_market_session)
+            price, quote_dt, source = await asyncio.to_thread(fetch_quote_for_session, session)
+            await query.edit_message_text(
+                format_report(price, quote_dt, state, source, compact=False),
+                parse_mode="HTML",
+                reply_markup=build_status_keyboard(state),
+            )
+        except BadRequest as e:
+            if "not modified" not in str(e).lower():
+                raise
+        except Exception as e:
+            await query.answer(f"Fetch failed: {e}", show_alert=True)
+
+    elif action in ("toggle_status", "toggle_help"):
+        state = load_state()
+        state["alerts_enabled"] = not state.get("alerts_enabled", True)
+        save_state(state)
+        label = "Alerts ON 🔔" if state["alerts_enabled"] else "Alerts PAUSED 🔕"
+        await query.answer(label)
+        kb = build_status_keyboard(state) if action == "toggle_status" else build_help_keyboard(state)
+        try:
+            await query.edit_message_reply_markup(reply_markup=kb)
+        except BadRequest:
+            pass
+
+    elif action == "help":
+        await query.answer()
+        state = load_state()
+        try:
+            await query.edit_message_text(
+                format_help(state),
+                parse_mode="HTML",
+                reply_markup=build_help_keyboard(state),
+            )
+        except BadRequest:
+            pass
 
 
 async def scheduled_check(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -511,12 +631,13 @@ async def scheduled_check(context: ContextTypes.DEFAULT_TYPE) -> None:
         await context.bot.send_message(
             chat_id=CHAT_ID,
             text=(
-                f"📌 *{TICKER} Grid Armed* ({source})\n"
-                f"Price: `${price:.2f}` (`{pct_from_be:+.2f}%` vs `${true_be:.2f}` BE)\n"
-                f"Next: 📉 `${step_price(true_be, down_step):.2f}` (`{step_label(down_step)}`) | "
-                f"📈 `${step_price(true_be, up_step):.2f}` (`{step_label(up_step)}`)"
+                f"📌 <b>{TICKER} Grid Armed</b> <i>({html.escape(source)})</i>\n"
+                f"<blockquote><b>Price:</b> <code>${price:.2f}</code> (<code>{pct_from_be:+.2f}%</code> vs <code>${true_be:.2f}</code> BE)\n"
+                f"📉 <code>${step_price(true_be, down_step):.2f}</code> (<code>{step_label(down_step)}</code>)  |  "
+                f"📈 <code>${step_price(true_be, up_step):.2f}</code> (<code>{step_label(up_step)}</code>)</blockquote>"
             ),
-            parse_mode="Markdown",
+            parse_mode="HTML",
+            reply_markup=build_status_keyboard(state),
         )
         return
 
@@ -528,7 +649,6 @@ async def scheduled_check(context: ContextTypes.DEFAULT_TYPE) -> None:
         new_step = math.ceil((pct_from_be - eps) / MOVE_PCT)
 
     if new_step is not None and new_step != last_step:
-        # Optional anti-whipsaw cooldown (never delays True Breakeven 0% crossings)
         if (
             ALERT_COOLDOWN_MINUTES > 0
             and new_step != 0
@@ -543,30 +663,46 @@ async def scheduled_check(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         if new_step == 0:
             header = (
-                f"🎯 *True Breakeven Reached* (`${true_be:.2f}`)"
+                f"🎯 <b>True Breakeven Reached</b> (<code>${true_be:.2f}</code>)"
                 if direction == "up"
-                else f"⚠️ *Back to True Breakeven* (`${true_be:.2f}`)"
+                else f"⚠️ <b>Back to True Breakeven</b> (<code>${true_be:.2f}</code>)"
             )
         elif direction == "up":
-            header = f"📈 *Crossed `{step_label(new_step)}` from BE*"
+            header = f"📈 <b>Crossed <code>{step_label(new_step)}</code> from BE</b>"
         else:
-            header = f"📉 *Dropped to `{step_label(new_step)}` from BE*"
+            header = f"📉 <b>Dropped to <code>{step_label(new_step)}</code> from BE</b>"
 
         await context.bot.send_message(
             chat_id=CHAT_ID,
-            text=f"{header}\n{format_report(price, quote_dt, state, source, compact=True)}",
-            parse_mode="Markdown",
+            text=format_report(price, quote_dt, state, source, compact=True, header=header),
+            parse_mode="HTML",
+            reply_markup=build_status_keyboard(state),
         )
 
 
+async def post_init(app: Application) -> None:
+    """Registers the native Telegram Menu button so commands never need to be memorized."""
+    await app.bot.set_my_commands([
+        BotCommand("status", "Live price, P&L & triggers"),
+        BotCommand("avg", "Update avg price (/avg 45.12)"),
+        BotCommand("buy", "Log a new buy (/buy 50 42.00)"),
+        BotCommand("set", "Set shares & avg (/set 15.73 45.12)"),
+        BotCommand("fees", "Update brokerage, extra fees & GST"),
+        BotCommand("toggle", "Pause or resume price alerts"),
+        BotCommand("help", "Show all commands & current config"),
+    ])
+
+
 def main() -> None:
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("status", status_cmd))
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler(["start", "status"], status_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("avg", avg_cmd))
     app.add_handler(CommandHandler("set", set_cmd))
     app.add_handler(CommandHandler("buy", buy_cmd))
     app.add_handler(CommandHandler("fees", fees_cmd))
     app.add_handler(CommandHandler("toggle", toggle_cmd))
+    app.add_handler(CallbackQueryHandler(button_handler))
 
     app.job_queue.run_repeating(scheduled_check, interval=60, first=10)
     print(
