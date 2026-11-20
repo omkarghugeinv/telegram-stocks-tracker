@@ -1,23 +1,31 @@
 import asyncio
 import json
 import os
-from datetime import datetime, timezone
+import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
+import requests
 import yfinance as yf
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = int(os.environ["CHAT_ID"])
+FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "").strip()
+
 TICKER = os.environ.get("TICKER", "SOXL")
-CHECK_MINUTES = int(os.environ.get("UPDATE_MINUTES", "2"))
+REGULAR_MINUTES = int(os.environ.get("REGULAR_MINUTES", "1"))
+EXTENDED_MINUTES = int(os.environ.get("EXTENDED_MINUTES", "3"))
 MOVE_PCT = float(os.environ.get("MOVE_PCT", "1.0"))
 
-# Default charge settings (can also be changed live via /fees in Telegram)
+# Default charge settings (also adjustable anytime via /fees in Telegram)
 DEFAULT_BROKERAGE_PCT = float(os.environ.get("BROKERAGE_PCT", "0.25"))  # per side (buy & sell)
 DEFAULT_GST_PCT = float(os.environ.get("GST_PCT", "18.0"))              # GST on brokerage
 DEFAULT_EXTRA_FEE_PCT = float(os.environ.get("FEE_PCT", "0.70"))        # extra/FX fees %
 BROKERAGE_CAP_USD = float(os.environ.get("BROKERAGE_CAP_USD", "25.0"))  # max brokerage per order
+YF_COOLDOWN_MINUTES = 15
 
+NY_TZ = ZoneInfo("America/New_York")
 DATA_DIR = "/app/data"
 os.makedirs(DATA_DIR, exist_ok=True)
 STATE_FILE = os.path.join(DATA_DIR, "position.json")
@@ -32,6 +40,25 @@ DEFAULT_STATE = {
     "last_alert_price": None,
     "breakeven_triggered": False,
 }
+
+YF_TICKER = yf.Ticker(TICKER)
+RUNTIME = {
+    "last_regular_check": 0.0,
+    "last_extended_check": 0.0,
+    "yf_cooldown_until": 0.0,
+}
+
+
+def get_market_session() -> str:
+    now_ny = datetime.now(NY_TZ)
+    if now_ny.weekday() >= 5:
+        return "closed"
+    mins = now_ny.hour * 60 + now_ny.minute
+    if 9 * 60 + 30 <= mins < 16 * 60:
+        return "regular"
+    if (4 * 60 <= mins < 9 * 60 + 30) or (16 * 60 <= mins < 20 * 60):
+        return "extended"
+    return "closed"
 
 
 def load_state() -> dict:
@@ -48,6 +75,51 @@ def load_state() -> dict:
 def save_state(state: dict) -> None:
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
+
+
+def fetch_finnhub_price(ticker: str) -> float:
+    if not FINNHUB_API_KEY:
+        raise ValueError("FINNHUB_API_KEY not configured")
+    resp = requests.get(
+        "https://finnhub.io/api/v1/quote",
+        params={"symbol": ticker},
+        headers={"X-Finnhub-Token": FINNHUB_API_KEY},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    price = float(data.get("c", 0))
+    if price <= 0:
+        raise ValueError(f"Invalid Finnhub quote response: {data}")
+    return price
+
+
+def fetch_yahoo_price() -> float:
+    for period in ("1d", "5d"):
+        df = YF_TICKER.history(period=period, interval="1m", prepost=True)
+        if not df.empty:
+            closes = df["Close"].dropna()
+            if not closes.empty:
+                return float(closes.iloc[-1])
+    raise ValueError("No Yahoo Finance price data returned.")
+
+
+def fetch_price_for_session(session: str) -> tuple[float, str]:
+    """Uses Finnhub during regular hours and Yahoo Finance during extended/closed hours."""
+    if session == "regular":
+        try:
+            return fetch_finnhub_price(TICKER), "Finnhub"
+        except Exception as e:
+            print(f"Finnhub failed ({e}); falling back to Yahoo Finance...")
+            return fetch_yahoo_price(), "Yahoo (Fallback)"
+
+    try:
+        return fetch_yahoo_price(), "Yahoo Extended"
+    except Exception as e:
+        if FINNHUB_API_KEY:
+            print(f"Yahoo failed ({e}); falling back to Finnhub...")
+            return fetch_finnhub_price(TICKER), "Finnhub (Fallback)"
+        raise
 
 
 def calculate_metrics(price: float, state: dict) -> dict:
@@ -69,7 +141,6 @@ def calculate_metrics(price: float, state: dict) -> dict:
     net_pnl = gross_pnl - total_charges
     net_pnl_pct = (net_pnl / invested) * 100.0 if invested > 0 else 0.0
 
-    # Exact sell price where net proceeds after sell brokerage equal total cost
     b_eff = brok_rate * gst_mult
     needed_net = invested + buy_brok + extra_fee
     if shares > 0:
@@ -98,18 +169,7 @@ def calculate_metrics(price: float, state: dict) -> dict:
     }
 
 
-def fetch_latest_price(ticker: str) -> float:
-    t = yf.Ticker(ticker)
-    for period in ("1d", "5d"):
-        df = t.history(period=period, interval="1m", prepost=True)
-        if not df.empty:
-            closes = df["Close"].dropna()
-            if not closes.empty:
-                return float(closes.iloc[-1])
-    raise ValueError("No price data returned.")
-
-
-def format_report(price: float, state: dict) -> str:
+def format_report(price: float, state: dict, source: str) -> str:
     m = calculate_metrics(price, state)
     avg = state["avg_price"]
     icon = "🟢" if m["net_pnl"] >= 0 else "🔴"
@@ -119,7 +179,7 @@ def format_report(price: float, state: dict) -> str:
     anchor_line = f"\n• Alert Anchor: `${anchor:.2f}` (`±{MOVE_PCT:g}%`)" if anchor else ""
 
     return (
-        f"{icon} *{TICKER} Position*\n"
+        f"{icon} *{TICKER} Position* ({source})\n"
         f"• Price: `${price:.2f}` (Avg: `${avg:.2f}`)\n"
         f"• True Breakeven: `${m['true_be']:.2f}`\n"
         f"• Value: `${m['current_val']:.2f}` / `${m['invested']:.2f}`\n"
@@ -134,14 +194,12 @@ def format_report(price: float, state: dict) -> str:
 
 def format_breakeven_summary(state: dict) -> str:
     m = calculate_metrics(state["avg_price"], state)
-    brok_pct = state["brokerage_pct"]
-    gst_pct = state["gst_pct"]
-    fee_pct = state["extra_fee_pct"]
     return (
         f"• Shares: `{state['shares']:.8f}`\n"
         f"• Raw Avg: `${state['avg_price']:.2f}`\n"
-        f"• Brokerage: `{brok_pct:g}%`/side + `{gst_pct:g}%` GST (`${m['buy_brok'] + m['sell_brok']:.2f}`)\n"
-        f"• Extra Fees: `{fee_pct:g}%` (`${m['extra_fee']:.2f}`)\n"
+        f"• Brokerage: `{state['brokerage_pct']:g}%`/side + `{state['gst_pct']:g}%` GST "
+        f"(`${m['buy_brok'] + m['sell_brok']:.2f}`)\n"
+        f"• Extra Fees: `{state['extra_fee_pct']:g}%` (`${m['extra_fee']:.2f}`)\n"
         f"• *True Breakeven:* `${m['true_be']:.2f}` (pure profit above this)"
     )
 
@@ -153,15 +211,19 @@ def is_authorized(update: Update) -> bool:
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
         return
+    session = get_market_session()
     try:
-        price = await asyncio.to_thread(fetch_latest_price, TICKER)
-        await update.message.reply_text(format_report(price, load_state()), parse_mode="Markdown")
+        price, source = await asyncio.to_thread(fetch_price_for_session, session)
+        await update.message.reply_text(
+            format_report(price, load_state(), f"{source} | {session}"),
+            parse_mode="Markdown",
+        )
     except Exception as e:
         await update.message.reply_text(f"Error fetching price: {e}")
 
 
 async def avg_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Usage: /avg <avg_price> — updates average price and auto-calculates brokerage + fees"""
+    """Usage: /avg <avg_price>"""
     if not is_authorized(update):
         return
     try:
@@ -279,14 +341,35 @@ async def scheduled_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     state = load_state()
     if not state.get("alerts_enabled", True):
         return
-    if datetime.now(timezone.utc).weekday() >= 5:
+
+    session = get_market_session()
+    if session == "closed":
         return
 
-    try:
-        price = await asyncio.to_thread(fetch_latest_price, TICKER)
-    except Exception as e:
-        print(f"Price check failed: {e}")
-        return
+    now = time.monotonic()
+
+    if session == "regular":
+        if now - RUNTIME["last_regular_check"] < (REGULAR_MINUTES * 60 - 5):
+            return
+        RUNTIME["last_regular_check"] = now
+        try:
+            price, source = await asyncio.to_thread(fetch_price_for_session, "regular")
+        except Exception as e:
+            print(f"Regular-hours price check failed: {e}")
+            return
+    else:
+        if now < RUNTIME["yf_cooldown_until"]:
+            return
+        if now - RUNTIME["last_extended_check"] < (EXTENDED_MINUTES * 60 - 5):
+            return
+        RUNTIME["last_extended_check"] = now
+        try:
+            price = await asyncio.to_thread(fetch_yahoo_price)
+            source = "Yahoo Extended"
+        except Exception as e:
+            RUNTIME["yf_cooldown_until"] = now + (YF_COOLDOWN_MINUTES * 60)
+            print(f"Yahoo extended check failed ({e}); cooling down {YF_COOLDOWN_MINUTES}m.")
+            return
 
     m = calculate_metrics(price, state)
     true_be = m["true_be"]
@@ -300,7 +383,7 @@ async def scheduled_check(context: ContextTypes.DEFAULT_TYPE) -> None:
         await context.bot.send_message(
             chat_id=CHAT_ID,
             text=(
-                f"📌 *{TICKER} Tracker Armed*\n"
+                f"📌 *{TICKER} Tracker Armed* ({source})\n"
                 f"• Baseline: `${price:.2f}`\n"
                 f"• Alerts: `±{MOVE_PCT:g}%` move or pure profit (`${true_be:.2f}`)"
             ),
@@ -312,12 +395,10 @@ async def scheduled_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     state_changed = False
     move_pct = ((price - anchor) / anchor) * 100.0 if anchor > 0 else 0.0
 
-    # 1) ±1% move from last alerted price
     if abs(move_pct) >= MOVE_PCT:
         arrow = "📈" if move_pct > 0 else "📉"
         reasons.append(f"{arrow} Moved `{move_pct:+.2f}%` (from `${anchor:.2f}`)")
 
-    # 2) Pure-profit crossover (re-arms if price dips 0.5% below true breakeven)
     if price >= true_be and not breakeven_triggered:
         reasons.append(f"🎯 Pure profit zone reached (`${true_be:.2f}` after brokerage & fees)")
         state["breakeven_triggered"] = True
@@ -332,7 +413,7 @@ async def scheduled_check(context: ContextTypes.DEFAULT_TYPE) -> None:
         header = "\n".join(reasons)
         await context.bot.send_message(
             chat_id=CHAT_ID,
-            text=f"{header}\n\n{format_report(price, state)}",
+            text=f"{header}\n\n{format_report(price, state, source)}",
             parse_mode="Markdown",
         )
     elif state_changed:
@@ -348,8 +429,12 @@ def main() -> None:
     app.add_handler(CommandHandler("fees", fees_cmd))
     app.add_handler(CommandHandler("toggle", toggle_cmd))
 
-    app.job_queue.run_repeating(scheduled_check, interval=CHECK_MINUTES * 60, first=10)
-    print(f"{TICKER} bot started (checking every {CHECK_MINUTES}m for ±{MOVE_PCT:g}% or pure profit)...")
+    # Master loop ticks every 60s; internal timers enforce REGULAR_MINUTES vs EXTENDED_MINUTES
+    app.job_queue.run_repeating(scheduled_check, interval=60, first=10)
+    print(
+        f"{TICKER} hybrid bot started "
+        f"(Finnhub every {REGULAR_MINUTES}m regular | Yahoo every {EXTENDED_MINUTES}m extended)..."
+    )
     app.run_polling()
 
 
