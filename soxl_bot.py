@@ -150,6 +150,12 @@ def parse_pct(raw: str, label: str, max_val: float = 100.0, allow_max: bool = Fa
     return val
 
 
+def fmt_signed_usd(val: float) -> str:
+    if abs(val) < 0.005:
+        val = 0.0
+    return f"{'+' if val >= 0 else '-'}${abs(val):.2f}"
+
+
 def fetch_finnhub_quote(ticker: str) -> tuple[float, datetime]:
     if not FINNHUB_API_KEY:
         raise ValueError("FINNHUB_API_KEY not configured")
@@ -197,14 +203,16 @@ def fetch_quote_for_session(session: str) -> tuple[float, datetime, str]:
             price, qdt = fetch_yahoo_quote()
             return price, qdt, "Yahoo (Fallback)"
 
+    yahoo_label = "Yahoo Extended" if session == "extended" else "Yahoo (Closed)"
     try:
         price, qdt = fetch_yahoo_quote()
-        return price, qdt, "Yahoo Extended"
+        return price, qdt, yahoo_label
     except Exception as e:
         if FINNHUB_API_KEY:
             print(f"Yahoo failed ({e}); falling back to Finnhub...")
             price, qdt = fetch_finnhub_quote(TICKER)
-            return price, qdt, "Finnhub (Fallback)"
+            fb_label = "Finnhub (Fallback)" if session == "extended" else "Finnhub (Closed)"
+            return price, qdt, fb_label
         raise
 
 
@@ -271,37 +279,40 @@ def step_label(step: int) -> str:
     return "0% BE" if step == 0 else f"{step * MOVE_PCT:+g}%"
 
 
-def format_report(price: float, quote_dt: datetime, state: dict, source: str) -> str:
+def format_report(
+    price: float, quote_dt: datetime, state: dict, source: str, compact: bool = False
+) -> str:
     m = calculate_metrics(price, state)
-    avg = state["avg_price"]
     true_be = m["true_be"]
     icon = "🟢" if m["net_pnl"] >= 0 else "🔴"
-    brok_total = m["buy_brok"] + m["sell_brok"]
-    ts_str = quote_dt.strftime("%b %d %H:%M ET")
+    net_str = fmt_signed_usd(m["net_pnl"])
 
     last_step = state.get("last_be_step")
     if last_step is not None and true_be > 0:
-        down_step = last_step - 1
-        up_step = last_step + 1
-        next_line = (
-            f"\n• Next Triggers: "
-            f"📉 `${step_price(true_be, down_step):.2f}` (`{step_label(down_step)}`) | "
-            f"📈 `${step_price(true_be, up_step):.2f}` (`{step_label(up_step)}`)"
+        down_p = step_price(true_be, last_step - 1)
+        up_p = step_price(true_be, last_step + 1)
+        next_short = f" • Next: `${down_p:.2f}` / `${up_p:.2f}`"
+        next_full = (
+            f" • Next: 📉 `${down_p:.2f}` (`{step_label(last_step - 1)}`) | "
+            f"📈 `${up_p:.2f}` (`{step_label(last_step + 1)}`)"
         )
     else:
-        next_line = ""
+        next_short = ""
+        next_full = ""
 
+    if compact:
+        return (
+            f"{icon} *{TICKER}* `${price:.2f}` (`{m['pct_from_be']:+.2f}%` vs BE)\n"
+            f"Net P&L: `{net_str}` (`{m['net_pnl_pct']:+.2f}%`)\n"
+            f"BE: `${true_be:.2f}`{next_short}"
+        )
+
+    ts_str = quote_dt.strftime("%b %d %H:%M ET")
     return (
-        f"{icon} *{TICKER} Position* ({source})\n"
-        f"• Price: `${price:.2f}` (Avg: `${avg:.2f}`) • `{ts_str}`\n"
-        f"• True Breakeven: `${true_be:.2f}` (`{m['pct_from_be']:+.2f}%` from BE)\n"
-        f"• Value: `${m['current_val']:.2f}` / `${m['invested']:.2f}`\n"
-        f"• Net P&L: `${m['net_pnl']:+.2f}` (`{m['net_pnl_pct']:+.2f}%`)\n"
-        f"• Gross P&L: `${m['gross_pnl']:+.2f}`\n"
-        f"• Charges: `${m['total_charges']:.2f}` "
-        f"(Brok+GST `${brok_total:.2f}` + Fees `${m['extra_fee']:.2f}`)\n"
-        f"• To Pure Profit: `${m['to_pure_profit']:+.2f}`/share"
-        f"{next_line}"
+        f"{icon} *{TICKER}* `${price:.2f}` (`{ts_str}` • {source})\n"
+        f"Net P&L: `{net_str}` (`{m['net_pnl_pct']:+.2f}%`) • Val: `${m['current_val']:.2f}`\n"
+        f"True BE: `${true_be:.2f}` (`{m['pct_from_be']:+.2f}%` | Avg `${state['avg_price']:.2f}`)\n"
+        f"Fees: `${m['total_charges']:.2f}`{next_full}"
     )
 
 
@@ -309,13 +320,11 @@ def format_breakeven_summary(state: dict) -> str:
     m = calculate_metrics(state["avg_price"], state)
     true_be = m["true_be"]
     return (
-        f"• Shares: `{state['shares']:.8f}`\n"
-        f"• Raw Avg: `${state['avg_price']:.2f}`\n"
-        f"• Brokerage: `{state['brokerage_pct']:g}%`/side + `{state['gst_pct']:g}%` GST "
-        f"(`${m['buy_brok'] + m['sell_brok']:.2f}`)\n"
-        f"• Extra Fees: `{state['extra_fee_pct']:g}%` (`${m['extra_fee']:.2f}`)\n"
-        f"• *True Breakeven (0%):* `${true_be:.2f}`\n"
-        f"• Grid Example: `-1%` `${step_price(true_be, -1):.2f}` | `+1%` `${step_price(true_be, 1):.2f}`"
+        f"• Shares: `{state['shares']:.8f}` | Avg: `${state['avg_price']:.2f}`\n"
+        f"• Fees: `${m['total_charges']:.2f}` "
+        f"(`{state['brokerage_pct']:g}%`+{state['gst_pct']:g}% GST, `{state['extra_fee_pct']:g}%` extra)\n"
+        f"• *True BE:* `${true_be:.2f}` "
+        f"(`-1%` `${step_price(true_be, -1):.2f}` | `+1%` `${step_price(true_be, 1):.2f}`)"
     )
 
 
@@ -330,7 +339,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         session = await asyncio.to_thread(get_market_session)
         price, quote_dt, source = await asyncio.to_thread(fetch_quote_for_session, session)
         await update.message.reply_text(
-            format_report(price, quote_dt, load_state(), f"{source} | {session}"),
+            format_report(price, quote_dt, load_state(), source, compact=False),
             parse_mode="Markdown",
         )
     except Exception as e:
@@ -350,7 +359,7 @@ async def avg_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         state["last_be_step"] = None
         save_state(state)
         await update.message.reply_text(
-            f"✅ *Average Price Updated*\n{format_breakeven_summary(state)}",
+            f"✅ *Average Updated*\n{format_breakeven_summary(state)}",
             parse_mode="Markdown",
         )
     except ValueError as e:
@@ -502,10 +511,10 @@ async def scheduled_check(context: ContextTypes.DEFAULT_TYPE) -> None:
         await context.bot.send_message(
             chat_id=CHAT_ID,
             text=(
-                f"📌 *{TICKER} Breakeven Grid Armed* ({source})\n"
-                f"• Price: `${price:.2f}` (`{pct_from_be:+.2f}%` from `${true_be:.2f}` BE)\n"
-                f"• Next Down Alert: `${step_price(true_be, down_step):.2f}` (`{step_label(down_step)}`)\n"
-                f"• Next Up Alert: `${step_price(true_be, up_step):.2f}` (`{step_label(up_step)}`)"
+                f"📌 *{TICKER} Grid Armed* ({source})\n"
+                f"Price: `${price:.2f}` (`{pct_from_be:+.2f}%` vs `${true_be:.2f}` BE)\n"
+                f"Next: 📉 `${step_price(true_be, down_step):.2f}` (`{step_label(down_step)}`) | "
+                f"📈 `${step_price(true_be, up_step):.2f}` (`{step_label(up_step)}`)"
             ),
             parse_mode="Markdown",
         )
@@ -534,18 +543,18 @@ async def scheduled_check(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         if new_step == 0:
             header = (
-                f"🎯 *True Breakeven Reached* (`0%` @ `${true_be:.2f}`)"
+                f"🎯 *True Breakeven Reached* (`${true_be:.2f}`)"
                 if direction == "up"
-                else f"⚠️ *Back to True Breakeven* (`0%` @ `${true_be:.2f}`)"
+                else f"⚠️ *Back to True Breakeven* (`${true_be:.2f}`)"
             )
         elif direction == "up":
-            header = f"📈 *Crossed `{step_label(new_step)}` from Breakeven* (now `{pct_from_be:+.2f}%`)"
+            header = f"📈 *Crossed `{step_label(new_step)}` from BE*"
         else:
-            header = f"📉 *Dropped to `{step_label(new_step)}` from Breakeven* (now `{pct_from_be:+.2f}%`)"
+            header = f"📉 *Dropped to `{step_label(new_step)}` from BE*"
 
         await context.bot.send_message(
             chat_id=CHAT_ID,
-            text=f"{header}\n\n{format_report(price, quote_dt, state, source)}",
+            text=f"{header}\n{format_report(price, quote_dt, state, source, compact=True)}",
             parse_mode="Markdown",
         )
 
