@@ -9,23 +9,38 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = int(os.environ["CHAT_ID"])
 TICKER = os.environ.get("TICKER", "SOXL")
-UPDATE_MINUTES = int(os.environ.get("UPDATE_MINUTES", "30"))
+CHECK_MINUTES = int(os.environ.get("UPDATE_MINUTES", "2"))
+MOVE_PCT = float(os.environ.get("MOVE_PCT", "1.0"))
+
+# Default charge settings (can also be changed live via /fees in Telegram)
+DEFAULT_BROKERAGE_PCT = float(os.environ.get("BROKERAGE_PCT", "0.25"))  # per side (buy & sell)
+DEFAULT_GST_PCT = float(os.environ.get("GST_PCT", "18.0"))              # GST on brokerage
+DEFAULT_EXTRA_FEE_PCT = float(os.environ.get("FEE_PCT", "0.70"))        # extra/FX fees %
+BROKERAGE_CAP_USD = float(os.environ.get("BROKERAGE_CAP_USD", "25.0"))  # max brokerage per order
 
 DATA_DIR = "/app/data"
 os.makedirs(DATA_DIR, exist_ok=True)
 STATE_FILE = os.path.join(DATA_DIR, "position.json")
 
 DEFAULT_STATE = {
-    "shares": 15.73700413,
-    "avg_price": 45.12,
+    "shares": 13.32899018,
+    "avg_price": 45.82,
+    "brokerage_pct": DEFAULT_BROKERAGE_PCT,
+    "gst_pct": DEFAULT_GST_PCT,
+    "extra_fee_pct": DEFAULT_EXTRA_FEE_PCT,
     "alerts_enabled": True,
+    "last_alert_price": None,
+    "breakeven_triggered": False,
 }
 
 
 def load_state() -> dict:
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r") as f:
-            return json.load(f)
+            data = json.load(f)
+        merged = DEFAULT_STATE.copy()
+        merged.update(data)
+        return merged
     save_state(DEFAULT_STATE)
     return DEFAULT_STATE.copy()
 
@@ -35,31 +50,99 @@ def save_state(state: dict) -> None:
         json.dump(state, f, indent=2)
 
 
+def calculate_metrics(price: float, state: dict) -> dict:
+    shares = state["shares"]
+    avg = state["avg_price"]
+    brok_rate = state["brokerage_pct"] / 100.0
+    gst_mult = 1.0 + (state["gst_pct"] / 100.0)
+    extra_rate = state["extra_fee_pct"] / 100.0
+
+    invested = shares * avg
+    current_val = shares * price
+
+    buy_brok = min(invested * brok_rate, BROKERAGE_CAP_USD) * gst_mult
+    sell_brok = min(current_val * brok_rate, BROKERAGE_CAP_USD) * gst_mult
+    extra_fee = invested * extra_rate
+    total_charges = buy_brok + sell_brok + extra_fee
+
+    gross_pnl = current_val - invested
+    net_pnl = gross_pnl - total_charges
+    net_pnl_pct = (net_pnl / invested) * 100.0 if invested > 0 else 0.0
+
+    # Exact sell price where net proceeds after sell brokerage equal total cost
+    b_eff = brok_rate * gst_mult
+    needed_net = invested + buy_brok + extra_fee
+    if shares > 0:
+        if b_eff < 1.0:
+            sell_val_needed = needed_net / (1.0 - b_eff)
+            if sell_val_needed * brok_rate > BROKERAGE_CAP_USD:
+                sell_val_needed = needed_net + (BROKERAGE_CAP_USD * gst_mult)
+        else:
+            sell_val_needed = needed_net
+        true_be = sell_val_needed / shares
+    else:
+        true_be = 0.0
+
+    return {
+        "invested": invested,
+        "current_val": current_val,
+        "buy_brok": buy_brok,
+        "sell_brok": sell_brok,
+        "extra_fee": extra_fee,
+        "total_charges": total_charges,
+        "gross_pnl": gross_pnl,
+        "net_pnl": net_pnl,
+        "net_pnl_pct": net_pnl_pct,
+        "true_be": true_be,
+        "to_pure_profit": true_be - price,
+    }
+
+
 def fetch_latest_price(ticker: str) -> float:
-    df = yf.Ticker(ticker).history(period="5d", interval="1m", prepost=True)
-    closes = df["Close"].dropna()
-    if closes.empty:
-        raise ValueError("No price data returned.")
-    return float(closes.iloc[-1])
+    t = yf.Ticker(ticker)
+    for period in ("1d", "5d"):
+        df = t.history(period=period, interval="1m", prepost=True)
+        if not df.empty:
+            closes = df["Close"].dropna()
+            if not closes.empty:
+                return float(closes.iloc[-1])
+    raise ValueError("No price data returned.")
 
 
 def format_report(price: float, state: dict) -> str:
-    shares = state["shares"]
+    m = calculate_metrics(price, state)
     avg = state["avg_price"]
-    invested = shares * avg
-    current_val = shares * price
-    pnl_usd = current_val - invested
-    pnl_pct = ((price - avg) / avg) * 100 if avg > 0 else 0.0
-    to_breakeven = avg - price
-    icon = "🟢" if pnl_usd >= 0 else "🔴"
+    icon = "🟢" if m["net_pnl"] >= 0 else "🔴"
+
+    brok_total = m["buy_brok"] + m["sell_brok"]
+    anchor = state.get("last_alert_price")
+    anchor_line = f"\n• Alert Anchor: `${anchor:.2f}` (`±{MOVE_PCT:g}%`)" if anchor else ""
 
     return (
-        f"{icon} *{TICKER} Update*\n"
+        f"{icon} *{TICKER} Position*\n"
         f"• Price: `${price:.2f}` (Avg: `${avg:.2f}`)\n"
-        f"• Shares: `{shares:.8f}`\n"
-        f"• Value: `${current_val:.2f}` / `${invested:.2f}`\n"
-        f"• P&L: `${pnl_usd:+.2f}` (`{pnl_pct:+.2f}%`)\n"
-        f"• To Breakeven: `${to_breakeven:+.2f}`/share"
+        f"• True Breakeven: `${m['true_be']:.2f}`\n"
+        f"• Value: `${m['current_val']:.2f}` / `${m['invested']:.2f}`\n"
+        f"• Net P&L: `${m['net_pnl']:+.2f}` (`{m['net_pnl_pct']:+.2f}%`)\n"
+        f"• Gross P&L: `${m['gross_pnl']:+.2f}`\n"
+        f"• Charges: `${m['total_charges']:.2f}` "
+        f"(Brok+GST `${brok_total:.2f}` + Fees `${m['extra_fee']:.2f}`)\n"
+        f"• To Pure Profit: `${m['to_pure_profit']:+.2f}`/share"
+        f"{anchor_line}"
+    )
+
+
+def format_breakeven_summary(state: dict) -> str:
+    m = calculate_metrics(state["avg_price"], state)
+    brok_pct = state["brokerage_pct"]
+    gst_pct = state["gst_pct"]
+    fee_pct = state["extra_fee_pct"]
+    return (
+        f"• Shares: `{state['shares']:.8f}`\n"
+        f"• Raw Avg: `${state['avg_price']:.2f}`\n"
+        f"• Brokerage: `{brok_pct:g}%`/side + `{gst_pct:g}%` GST (`${m['buy_brok'] + m['sell_brok']:.2f}`)\n"
+        f"• Extra Fees: `{fee_pct:g}%` (`${m['extra_fee']:.2f}`)\n"
+        f"• *True Breakeven:* `${m['true_be']:.2f}` (pure profit above this)"
     )
 
 
@@ -77,7 +160,31 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(f"Error fetching price: {e}")
 
 
+async def avg_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Usage: /avg <avg_price> — updates average price and auto-calculates brokerage + fees"""
+    if not is_authorized(update):
+        return
+    try:
+        avg_price = float(context.args[0])
+        state = load_state()
+        state["avg_price"] = avg_price
+        true_be = calculate_metrics(avg_price, state)["true_be"]
+        anchor = state.get("last_alert_price")
+        state["breakeven_triggered"] = (anchor >= true_be) if anchor is not None else False
+        save_state(state)
+        await update.message.reply_text(
+            f"✅ *Average Price Updated*\n{format_breakeven_summary(state)}",
+            parse_mode="Markdown",
+        )
+    except (IndexError, ValueError):
+        await update.message.reply_text(
+            "Usage: `/avg <avg_price>`\nExample: `/avg 45.82`",
+            parse_mode="Markdown",
+        )
+
+
 async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Usage: /set <shares> <avg_price>"""
     if not is_authorized(update):
         return
     try:
@@ -86,19 +193,23 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         state = load_state()
         state["shares"] = shares
         state["avg_price"] = avg_price
+        true_be = calculate_metrics(avg_price, state)["true_be"]
+        anchor = state.get("last_alert_price")
+        state["breakeven_triggered"] = (anchor >= true_be) if anchor is not None else False
         save_state(state)
         await update.message.reply_text(
-            f"✅ Position updated: `{shares}` shares @ `${avg_price:.2f}`",
+            f"✅ *Position Updated*\n{format_breakeven_summary(state)}",
             parse_mode="Markdown",
         )
     except (IndexError, ValueError):
         await update.message.reply_text(
-            "Usage: `/set <shares> <avg_price>`\nExample: `/set 15.58 45.60`",
+            "Usage: `/set <shares> <avg_price>`\nExample: `/set 13.32899018 45.82`",
             parse_mode="Markdown",
         )
 
 
 async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Usage: /buy <usd_spent> <buy_price>"""
     if not is_authorized(update):
         return
     try:
@@ -110,16 +221,46 @@ async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         new_avg = (old_cost + usd_spent) / new_shares
         state["shares"] = new_shares
         state["avg_price"] = new_avg
+        true_be = calculate_metrics(buy_price, state)["true_be"]
+        state["last_alert_price"] = buy_price
+        state["breakeven_triggered"] = buy_price >= true_be
         save_state(state)
         await update.message.reply_text(
-            f"✅ Added `${usd_spent:.2f}` @ `${buy_price:.2f}`\n"
-            f"• New Shares: `{new_shares:.8f}`\n"
-            f"• New Avg: `${new_avg:.2f}`",
+            f"✅ *Added `${usd_spent:.2f}` @ `${buy_price:.2f}`*\n"
+            f"{format_breakeven_summary(state)}\n"
+            f"• Alert Anchor reset to `${buy_price:.2f}`",
             parse_mode="Markdown",
         )
     except (IndexError, ValueError, ZeroDivisionError):
         await update.message.reply_text(
             "Usage: `/buy <usd_spent> <buy_price>`\nExample: `/buy 50 42.00`",
+            parse_mode="Markdown",
+        )
+
+
+async def fees_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Usage: /fees <brokerage_per_side_pct> <extra_fee_pct>"""
+    if not is_authorized(update):
+        return
+    try:
+        brok_pct = float(context.args[0])
+        extra_pct = float(context.args[1])
+        state = load_state()
+        state["brokerage_pct"] = brok_pct
+        state["extra_fee_pct"] = extra_pct
+        true_be = calculate_metrics(state["avg_price"], state)["true_be"]
+        anchor = state.get("last_alert_price")
+        state["breakeven_triggered"] = (anchor >= true_be) if anchor is not None else False
+        save_state(state)
+        await update.message.reply_text(
+            f"✅ *Charge Rates Updated*\n{format_breakeven_summary(state)}",
+            parse_mode="Markdown",
+        )
+    except (IndexError, ValueError):
+        await update.message.reply_text(
+            "Usage: `/fees <brokerage_per_side_%> <extra_fee_%>`\n"
+            "• Standard (`0.25%`/side + `0.70%` fees): `/fees 0.25 0.70`\n"
+            "• All-in `0.70%` only: `/fees 0 0.70`",
             parse_mode="Markdown",
         )
 
@@ -131,35 +272,84 @@ async def toggle_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     state["alerts_enabled"] = not state.get("alerts_enabled", True)
     save_state(state)
     label = "ON" if state["alerts_enabled"] else "PAUSED"
-    await update.message.reply_text(f"Scheduled alerts are now *{label}*.", parse_mode="Markdown")
+    await update.message.reply_text(f"Trigger alerts are now *{label}*.", parse_mode="Markdown")
 
 
-async def scheduled_update(context: ContextTypes.DEFAULT_TYPE) -> None:
+async def scheduled_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     state = load_state()
     if not state.get("alerts_enabled", True):
         return
     if datetime.now(timezone.utc).weekday() >= 5:
         return
+
     try:
         price = await asyncio.to_thread(fetch_latest_price, TICKER)
+    except Exception as e:
+        print(f"Price check failed: {e}")
+        return
+
+    m = calculate_metrics(price, state)
+    true_be = m["true_be"]
+    anchor = state.get("last_alert_price")
+    breakeven_triggered = state.get("breakeven_triggered", False)
+
+    if anchor is None:
+        state["last_alert_price"] = price
+        state["breakeven_triggered"] = price >= true_be
+        save_state(state)
         await context.bot.send_message(
             chat_id=CHAT_ID,
-            text=format_report(price, state),
+            text=(
+                f"📌 *{TICKER} Tracker Armed*\n"
+                f"• Baseline: `${price:.2f}`\n"
+                f"• Alerts: `±{MOVE_PCT:g}%` move or pure profit (`${true_be:.2f}`)"
+            ),
             parse_mode="Markdown",
         )
-    except Exception as e:
-        print(f"Scheduled update failed: {e}")
+        return
+
+    reasons = []
+    state_changed = False
+    move_pct = ((price - anchor) / anchor) * 100.0 if anchor > 0 else 0.0
+
+    # 1) ±1% move from last alerted price
+    if abs(move_pct) >= MOVE_PCT:
+        arrow = "📈" if move_pct > 0 else "📉"
+        reasons.append(f"{arrow} Moved `{move_pct:+.2f}%` (from `${anchor:.2f}`)")
+
+    # 2) Pure-profit crossover (re-arms if price dips 0.5% below true breakeven)
+    if price >= true_be and not breakeven_triggered:
+        reasons.append(f"🎯 Pure profit zone reached (`${true_be:.2f}` after brokerage & fees)")
+        state["breakeven_triggered"] = True
+        state_changed = True
+    elif price < true_be * 0.995 and breakeven_triggered:
+        state["breakeven_triggered"] = False
+        state_changed = True
+
+    if reasons:
+        state["last_alert_price"] = price
+        save_state(state)
+        header = "\n".join(reasons)
+        await context.bot.send_message(
+            chat_id=CHAT_ID,
+            text=f"{header}\n\n{format_report(price, state)}",
+            parse_mode="Markdown",
+        )
+    elif state_changed:
+        save_state(state)
 
 
 def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("avg", avg_cmd))
     app.add_handler(CommandHandler("set", set_cmd))
     app.add_handler(CommandHandler("buy", buy_cmd))
+    app.add_handler(CommandHandler("fees", fees_cmd))
     app.add_handler(CommandHandler("toggle", toggle_cmd))
 
-    app.job_queue.run_repeating(scheduled_update, interval=UPDATE_MINUTES * 60, first=10)
-    print(f"{TICKER} Telegram bot started (interval: {UPDATE_MINUTES}m)...")
+    app.job_queue.run_repeating(scheduled_check, interval=CHECK_MINUTES * 60, first=10)
+    print(f"{TICKER} bot started (checking every {CHECK_MINUTES}m for ±{MOVE_PCT:g}% or pure profit)...")
     app.run_polling()
 
 
