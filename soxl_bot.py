@@ -10,12 +10,20 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 import requests
 import yfinance as yf
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import BadRequest
+from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
+from telegram.error import BadRequest, Forbidden
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHAT_ID = int(os.environ["CHAT_ID"])
+ADMIN_CHAT_ID = int(os.environ["CHAT_ID"])
+ADMIN_KEY = str(ADMIN_CHAT_ID)
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "").strip()
 
 DEFAULT_TICKER = os.environ.get("TICKER", "SOXL").strip().upper()
@@ -25,7 +33,7 @@ MOVE_PCT = float(os.environ.get("MOVE_PCT", "1.0"))
 ALERT_COOLDOWN_MINUTES = float(os.environ.get("ALERT_COOLDOWN_MINUTES", "0"))
 STALE_QUOTE_MINUTES = int(os.environ.get("STALE_QUOTE_MINUTES", "20"))
 
-# Default charge settings (also adjustable anytime via /fees in Telegram)
+# Default charge settings for new portfolios (adjustable per portfolio via /fees)
 DEFAULT_BROKERAGE_PCT = float(os.environ.get("BROKERAGE_PCT", "0.25"))  # per side (buy & sell)
 DEFAULT_GST_PCT = float(os.environ.get("GST_PCT", "18.0"))              # GST on brokerage
 DEFAULT_EXTRA_FEE_PCT = float(os.environ.get("FEE_PCT", "0.70"))        # extra/FX fees %
@@ -40,18 +48,26 @@ STATE_FILE = os.path.join(DATA_DIR, "position.json")
 
 TICKER_RE = re.compile(r"^[A-Z0-9.\-^]{1,12}$")
 
-DEFAULT_STATE = {
-    "brokerage_pct": DEFAULT_BROKERAGE_PCT,
-    "gst_pct": DEFAULT_GST_PCT,
-    "extra_fee_pct": DEFAULT_EXTRA_FEE_PCT,
-    "alerts_enabled": True,
-    "positions": {
-        DEFAULT_TICKER: {
-            "shares": 13.32899018,
-            "avg_price": 45.82,
-            "last_be_step": None,
-        }
-    },
+ROLE_ALIASES = {
+    "ro": "shared_ro",
+    "readonly": "shared_ro",
+    "read-only": "shared_ro",
+    "view": "shared_ro",
+    "shared-ro": "shared_ro",
+    "shared_ro": "shared_ro",
+    "edit": "shared_edit",
+    "shared-edit": "shared_edit",
+    "shared_edit": "shared_edit",
+    "separate": "separate",
+    "own": "separate",
+    "personal": "separate",
+}
+
+ROLE_LABELS = {
+    "admin": "Admin (Owner)",
+    "shared_edit": "Shared • Edit",
+    "shared_ro": "Shared • Read-Only",
+    "separate": "Separate Portfolio",
 }
 
 YF_TICKERS: dict[str, yf.Ticker] = {}
@@ -59,16 +75,72 @@ RUNTIME = {
     "last_regular_check": 0.0,
     "last_extended_check": 0.0,
     "yf_cooldown_until": 0.0,
-    "last_alert_sent_at": {},
+    "last_alert_sent_at": {},  # keyed by (portfolio_id, symbol)
     "market_status_checked_at": 0.0,
     "cached_session": "closed",
 }
+
+
+def make_empty_portfolio() -> dict:
+    return {
+        "brokerage_pct": DEFAULT_BROKERAGE_PCT,
+        "gst_pct": DEFAULT_GST_PCT,
+        "extra_fee_pct": DEFAULT_EXTRA_FEE_PCT,
+        "alerts_enabled": True,
+        "positions": {},
+    }
+
+
+def make_default_state() -> dict:
+    admin_portfolio = make_empty_portfolio()
+    admin_portfolio["positions"][DEFAULT_TICKER] = {
+        "shares": 13.32899018,
+        "avg_price": 45.82,
+        "last_be_step": None,
+    }
+    return {
+        "schema_version": 3,
+        "users": {
+            ADMIN_KEY: {
+                "role": "admin",
+                "portfolio_id": ADMIN_KEY,
+                "label": "Admin",
+            }
+        },
+        "portfolios": {
+            ADMIN_KEY: admin_portfolio,
+        },
+    }
 
 
 def get_yf_ticker(symbol: str) -> yf.Ticker:
     if symbol not in YF_TICKERS:
         YF_TICKERS[symbol] = yf.Ticker(symbol)
     return YF_TICKERS[symbol]
+
+
+def prune_unused_caches(state: dict) -> None:
+    active_pairs = set()
+    active_symbols = set()
+    for pid, pf in state["portfolios"].items():
+        for sym in pf["positions"]:
+            active_pairs.add((pid, sym))
+            active_symbols.add(sym)
+
+    for key in list(RUNTIME["last_alert_sent_at"].keys()):
+        if key not in active_pairs:
+            RUNTIME["last_alert_sent_at"].pop(key, None)
+
+    for sym in list(YF_TICKERS.keys()):
+        if sym not in active_symbols:
+            YF_TICKERS.pop(sym, None)
+
+
+def remove_position(state: dict, portfolio_id: str, sym: str) -> None:
+    pf = state["portfolios"].get(portfolio_id)
+    if pf and sym in pf["positions"]:
+        del pf["positions"][sym]
+    prune_unused_caches(state)
 
 
 def fallback_market_session() -> str:
@@ -120,16 +192,74 @@ def get_market_session() -> str:
         return local_session
 
 
+def normalize_portfolio(raw: dict) -> dict:
+    pf = {
+        "brokerage_pct": float(raw.get("brokerage_pct", DEFAULT_BROKERAGE_PCT)),
+        "gst_pct": float(raw.get("gst_pct", DEFAULT_GST_PCT)),
+        "extra_fee_pct": float(raw.get("extra_fee_pct", DEFAULT_EXTRA_FEE_PCT)),
+        "alerts_enabled": bool(raw.get("alerts_enabled", True)),
+        "positions": {},
+    }
+    for sym, pos in (raw.get("positions") or {}).items():
+        if not isinstance(pos, dict):
+            continue
+        s = float(pos.get("shares", 0))
+        a = float(pos.get("avg_price", 0))
+        if s > 0 and a > 0:
+            pf["positions"][sym.upper()] = {
+                "shares": s,
+                "avg_price": a,
+                "last_be_step": pos.get("last_be_step"),
+            }
+    return pf
+
+
 def load_state() -> dict:
-    """Loads position.json and automatically migrates legacy single-ticker state."""
+    """Loads position.json and auto-migrates v1/v2 formats to multi-user v3."""
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r") as f:
                 data = json.load(f)
 
-            # Migrate old flat single-ticker format -> multi-ticker format
-            if "positions" not in data:
-                migrated = {
+            # Already v3 multi-user format
+            if "users" in data and "portfolios" in data:
+                portfolios = {
+                    str(pid): normalize_portfolio(pf)
+                    for pid, pf in (data.get("portfolios") or {}).items()
+                    if isinstance(pf, dict)
+                }
+                if ADMIN_KEY not in portfolios:
+                    portfolios[ADMIN_KEY] = make_empty_portfolio()
+
+                users = {}
+                for uid, u in (data.get("users") or {}).items():
+                    if not isinstance(u, dict):
+                        continue
+                    uid_s = str(uid)
+                    role = u.get("role", "shared_ro")
+                    if role not in ROLE_LABELS:
+                        role = "shared_ro"
+                    pid = str(u.get("portfolio_id") or (uid_s if role == "separate" else ADMIN_KEY))
+                    if pid not in portfolios:
+                        portfolios[pid] = make_empty_portfolio()
+                    users[uid_s] = {
+                        "role": role,
+                        "portfolio_id": pid,
+                        "label": str(u.get("label") or "").strip(),
+                    }
+
+                users[ADMIN_KEY] = {
+                    "role": "admin",
+                    "portfolio_id": ADMIN_KEY,
+                    "label": users.get(ADMIN_KEY, {}).get("label") or "Admin",
+                }
+                return {"schema_version": 3, "users": users, "portfolios": portfolios}
+
+            # Migrate v2 (multi-ticker single-user) or v1 (flat single-ticker)
+            if "positions" in data:
+                admin_pf = normalize_portfolio(data)
+            else:
+                admin_pf = {
                     "brokerage_pct": float(data.get("brokerage_pct", DEFAULT_BROKERAGE_PCT)),
                     "gst_pct": float(data.get("gst_pct", DEFAULT_GST_PCT)),
                     "extra_fee_pct": float(data.get("extra_fee_pct", DEFAULT_EXTRA_FEE_PCT)),
@@ -139,38 +269,30 @@ def load_state() -> dict:
                 shares = float(data.get("shares", 0))
                 avg_price = float(data.get("avg_price", 0))
                 if shares > 0 and avg_price > 0:
-                    migrated["positions"][DEFAULT_TICKER] = {
+                    admin_pf["positions"][DEFAULT_TICKER] = {
                         "shares": shares,
                         "avg_price": avg_price,
                         "last_be_step": data.get("last_be_step"),
                     }
-                save_state(migrated)
-                print(f"Migrated legacy position.json to multi-ticker format ({list(migrated['positions'].keys())}).")
-                return migrated
 
-            state = {
-                "brokerage_pct": float(data.get("brokerage_pct", DEFAULT_BROKERAGE_PCT)),
-                "gst_pct": float(data.get("gst_pct", DEFAULT_GST_PCT)),
-                "extra_fee_pct": float(data.get("extra_fee_pct", DEFAULT_EXTRA_FEE_PCT)),
-                "alerts_enabled": bool(data.get("alerts_enabled", True)),
-                "positions": {},
-            }
-            for sym, pos in (data.get("positions") or {}).items():
-                if not isinstance(pos, dict):
-                    continue
-                s = float(pos.get("shares", 0))
-                a = float(pos.get("avg_price", 0))
-                if s > 0 and a > 0:
-                    state["positions"][sym.upper()] = {
-                        "shares": s,
-                        "avg_price": a,
-                        "last_be_step": pos.get("last_be_step"),
+            migrated = {
+                "schema_version": 3,
+                "users": {
+                    ADMIN_KEY: {
+                        "role": "admin",
+                        "portfolio_id": ADMIN_KEY,
+                        "label": "Admin",
                     }
-            return state
+                },
+                "portfolios": {ADMIN_KEY: admin_pf},
+            }
+            save_state(migrated)
+            print("Migrated position.json to multi-user v3 schema.")
+            return migrated
         except Exception as e:
             print(f"Failed to read {STATE_FILE} ({e}); falling back to defaults.")
 
-    fresh = json.loads(json.dumps(DEFAULT_STATE))
+    fresh = make_default_state()
     save_state(fresh)
     return fresh
 
@@ -190,11 +312,41 @@ def save_state(state: dict) -> None:
         raise
 
 
+def can_edit(user: dict) -> bool:
+    return user["role"] in ("admin", "shared_edit", "separate")
+
+
+def is_admin_user(user: dict | None) -> bool:
+    return bool(user and user["role"] == "admin")
+
+
+def get_user_context(update: Update) -> tuple[dict, str | None, dict | None, dict | None]:
+    state = load_state()
+    if not update.effective_chat:
+        return state, None, None, None
+    uid = str(update.effective_chat.id)
+    user = state["users"].get(uid)
+    if not user:
+        return state, uid, None, None
+    portfolio = state["portfolios"].get(user["portfolio_id"])
+    return state, uid, user, portfolio
+
+
 def parse_ticker(raw: str) -> str:
     sym = raw.strip().lstrip("$").upper()
     if not TICKER_RE.match(sym):
         raise ValueError(f"Invalid ticker symbol: <code>{html.escape(raw)}</code>")
     return sym
+
+
+def parse_chat_id(raw: str) -> int:
+    try:
+        val = int(raw.strip())
+    except ValueError:
+        raise ValueError("Chat ID must be a valid integer.")
+    if val == 0:
+        raise ValueError("Chat ID cannot be 0.")
+    return val
 
 
 def parse_positive(raw: str, label: str) -> float:
@@ -285,17 +437,30 @@ def fetch_quote_for_session(ticker: str, session: str) -> tuple[float, datetime,
         raise
 
 
+async def fetch_quotes_batch(tickers: list[str], session: str) -> tuple[dict, dict]:
+    quotes = {}
+    errors = {}
+    for idx, sym in enumerate(tickers):
+        if idx > 0:
+            await asyncio.sleep(0.25)
+        try:
+            quotes[sym] = await asyncio.to_thread(fetch_quote_for_session, sym, session)
+        except Exception as e:
+            errors[sym] = str(e)
+    return quotes, errors
+
+
 def is_quote_stale(quote_dt: datetime) -> bool:
     age_seconds = (datetime.now(NY_TZ) - quote_dt).total_seconds()
     return age_seconds > STALE_QUOTE_MINUTES * 60
 
 
-def calculate_metrics(price: float, pos: dict, state: dict) -> dict:
+def calculate_metrics(price: float, pos: dict, portfolio: dict) -> dict:
     shares = pos["shares"]
     avg = pos["avg_price"]
-    brok_rate = state["brokerage_pct"] / 100.0
-    gst_mult = 1.0 + (state["gst_pct"] / 100.0)
-    extra_rate = state["extra_fee_pct"] / 100.0
+    brok_rate = portfolio["brokerage_pct"] / 100.0
+    gst_mult = 1.0 + (portfolio["gst_pct"] / 100.0)
+    extra_rate = portfolio["extra_fee_pct"] / 100.0
 
     invested = shares * avg
     current_val = shares * price
@@ -344,25 +509,21 @@ def step_label(step: int) -> str:
     return "0% BE" if step == 0 else f"{step * MOVE_PCT:+g}%"
 
 
-def build_status_keyboard(state: dict) -> InlineKeyboardMarkup:
-    alert_btn = "🔔 Alerts: ON" if state.get("alerts_enabled", True) else "🔕 Paused"
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🔄 Refresh", callback_data="refresh"),
-            InlineKeyboardButton(alert_btn, callback_data="toggle_status"),
-            InlineKeyboardButton("⚙️ Commands", callback_data="help"),
-        ]
-    ])
+def build_status_keyboard(portfolio: dict, editable: bool) -> InlineKeyboardMarkup:
+    row = [InlineKeyboardButton("🔄 Refresh", callback_data="refresh")]
+    if editable:
+        alert_btn = "🔔 Alerts: ON" if portfolio.get("alerts_enabled", True) else "🔕 Paused"
+        row.append(InlineKeyboardButton(alert_btn, callback_data="toggle_status"))
+    row.append(InlineKeyboardButton("⚙️ Commands", callback_data="help"))
+    return InlineKeyboardMarkup([row])
 
 
-def build_help_keyboard(state: dict) -> InlineKeyboardMarkup:
-    alert_btn = "🔔 Alerts: ON" if state.get("alerts_enabled", True) else "🔕 Paused"
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("⬅️ Live Status", callback_data="refresh"),
-            InlineKeyboardButton(alert_btn, callback_data="toggle_help"),
-        ]
-    ])
+def build_help_keyboard(portfolio: dict, editable: bool) -> InlineKeyboardMarkup:
+    row = [InlineKeyboardButton("⬅️ Live Status", callback_data="refresh")]
+    if editable:
+        alert_btn = "🔔 Alerts: ON" if portfolio.get("alerts_enabled", True) else "🔕 Paused"
+        row.append(InlineKeyboardButton(alert_btn, callback_data="toggle_help"))
+    return InlineKeyboardMarkup([row])
 
 
 def format_single_card(
@@ -370,12 +531,12 @@ def format_single_card(
     price: float,
     quote_dt: datetime,
     pos: dict,
-    state: dict,
+    portfolio: dict,
     source: str,
     compact: bool = False,
     header: str | None = None,
 ) -> str:
-    m = calculate_metrics(price, pos, state)
+    m = calculate_metrics(price, pos, portfolio)
     true_be = m["true_be"]
     icon = "🟢" if m["net_pnl"] >= 0 else "🔴"
     net_str = fmt_signed_usd(m["net_pnl"])
@@ -417,25 +578,28 @@ def format_single_card(
     )
 
 
-def format_portfolio_status(state: dict, quotes: dict[str, tuple[float, datetime, str]], errors: dict[str, str]) -> str:
-    positions = state["positions"]
+def format_portfolio_status(
+    portfolio: dict,
+    quotes: dict[str, tuple[float, datetime, str]],
+    errors: dict[str, str],
+    editable: bool,
+) -> str:
+    positions = portfolio["positions"]
     if not positions:
-        return (
-            "📭 <b>No Active Positions</b>\n"
-            "<blockquote>Add a stock or ETF anytime:\n"
-            "• <code>/add TQQQ 10 75.50</code>\n"
-            "• <code>/buy SOXL 100 41.00</code></blockquote>"
+        hint = (
+            "Add a stock or ETF anytime:\n• <code>/add TQQQ 10 75.50</code>\n• <code>/buy SOXL 100 41.00</code>"
+            if editable
+            else "The shared portfolio currently has no active holdings."
         )
+        return f"📭 <b>No Active Positions</b>\n<blockquote>{hint}</blockquote>"
 
-    # Single holding: show the classic clean single-ticker card
     if len(positions) == 1:
         sym, pos = next(iter(positions.items()))
         if sym in quotes:
             price, qdt, src = quotes[sym]
-            return format_single_card(sym, price, qdt, pos, state, src, compact=False)
+            return format_single_card(sym, price, qdt, pos, portfolio, src, compact=False)
         return f"⚠️ <b>{html.escape(sym)}</b> fetch failed: {html.escape(errors.get(sym, 'Unknown error'))}"
 
-    # Multiple holdings: portfolio total header + one compact card per ticker
     total_val = 0.0
     total_inv = 0.0
     total_net = 0.0
@@ -455,7 +619,7 @@ def format_portfolio_status(state: dict, quotes: dict[str, tuple[float, datetime
             latest_dt = qdt
             last_src = src
 
-        m = calculate_metrics(price, pos, state)
+        m = calculate_metrics(price, pos, portfolio)
         total_val += m["current_val"]
         total_inv += m["invested"]
         total_net += m["net_pnl"]
@@ -496,28 +660,28 @@ def format_portfolio_status(state: dict, quotes: dict[str, tuple[float, datetime
     return header + "\n".join(blocks)
 
 
-def format_breakeven_summary(ticker: str, state: dict) -> str:
-    pos = state["positions"][ticker]
-    m = calculate_metrics(pos["avg_price"], pos, state)
+def format_breakeven_summary(ticker: str, portfolio: dict) -> str:
+    pos = portfolio["positions"][ticker]
+    m = calculate_metrics(pos["avg_price"], pos, portfolio)
     true_be = m["true_be"]
     return (
         f"<blockquote><b>Ticker:</b> <code>{html.escape(ticker)}</code>\n"
         f"<b>Shares:</b> <code>{pos['shares']:.8f}</code>  |  <b>Avg:</b> <code>${pos['avg_price']:.2f}</code>\n"
         f"<b>Fees:</b> <code>${m['total_charges']:.2f}</code> "
-        f"(<code>{state['brokerage_pct']:g}%</code> + <code>{state['gst_pct']:g}%</code> GST, "
-        f"<code>{state['extra_fee_pct']:g}%</code> extra)\n"
+        f"(<code>{portfolio['brokerage_pct']:g}%</code> + <code>{portfolio['gst_pct']:g}%</code> GST, "
+        f"<code>{portfolio['extra_fee_pct']:g}%</code> extra)\n"
         f"<b>True BE:</b> <code>${true_be:.2f}</code> "
         f"(<code>-1%</code> <code>${step_price(true_be, -1):.2f}</code> | "
         f"<code>+1%</code> <code>${step_price(true_be, 1):.2f}</code>)</blockquote>"
     )
 
 
-def format_help(state: dict) -> str:
-    positions = state["positions"]
+def format_help(user: dict, portfolio: dict) -> str:
+    positions = portfolio["positions"]
     if positions:
         holding_lines = []
         for sym, pos in positions.items():
-            be = calculate_metrics(pos["avg_price"], pos, state)["true_be"]
+            be = calculate_metrics(pos["avg_price"], pos, portfolio)["true_be"]
             holding_lines.append(
                 f"• <b>{html.escape(sym)}</b>: <code>{pos['shares']:.4f}</code> sh @ "
                 f"<code>${pos['avg_price']:.2f}</code> (BE <code>${be:.2f}</code>)"
@@ -528,51 +692,107 @@ def format_help(state: dict) -> str:
         holdings_block = "• <i>None (alerts idle)</i>"
         sample_sym = "SOXL"
 
-    return (
-        f"⚙️ <b>Portfolio Tracker Settings &amp; Commands</b>\n"
-        f"<blockquote><b>Holdings:</b>\n{holdings_block}\n"
-        f"<b>Grid:</b> <code>±{MOVE_PCT:g}%</code> from BE  |  "
-        f"<b>Charges:</b> <code>{state['brokerage_pct']:g}%</code> + <code>{state['gst_pct']:g}%</code> GST + <code>{state['extra_fee_pct']:g}%</code> extra</blockquote>\n"
-        f"<b>Tap any example to copy:</b>\n"
-        f"• <code>/status</code> — Live portfolio P&amp;L &amp; triggers\n"
-        f"• <code>/add TQQQ 10 75.50</code> — Add a new ticker (or overwrite)\n"
-        f"• <code>/buy {sample_sym} 100 41.00</code> — Log a buy (USD &amp; price)\n"
-        f"• <code>/sell {sample_sym}</code> — Remove sold ticker (no record)\n"
-        f"• <code>/sell {sample_sym} 5</code> — Trim 5 shares only\n"
-        f"• <code>/avg {sample_sym} 45.12</code> — Update avg price\n"
-        f"• <code>/fees {state['brokerage_pct']:g} {state['extra_fee_pct']:g} {state['gst_pct']:g}</code> — Update brok / extra / GST %\n"
-        f"• <code>/toggle</code> — Pause or resume alerts"
-    )
+    role_text = ROLE_LABELS.get(user["role"], user["role"])
+    alerts_text = "ON 🔔" if portfolio.get("alerts_enabled", True) else "PAUSED 🔕"
+
+    lines = [
+        f"⚙️ <b>Portfolio Tracker • {html.escape(role_text)}</b>",
+        (
+            f"<blockquote><b>Holdings:</b>\n{holdings_block}\n"
+            f"<b>Alerts:</b> {alerts_text}  |  <b>Grid:</b> <code>±{MOVE_PCT:g}%</code> from BE\n"
+            f"<b>Charges:</b> <code>{portfolio['brokerage_pct']:g}%</code> + "
+            f"<code>{portfolio['gst_pct']:g}%</code> GST + <code>{portfolio['extra_fee_pct']:g}%</code> extra</blockquote>"
+        ),
+        "<b>Commands (tap to copy):</b>",
+        "• <code>/status</code> — Live portfolio P&amp;L &amp; triggers",
+    ]
+
+    if can_edit(user):
+        lines.extend([
+            "• <code>/add TQQQ 10 75.50</code> — Add a ticker (or overwrite)",
+            f"• <code>/buy {sample_sym} 100 41.00</code> — Log a buy (USD &amp; price)",
+            f"• <code>/sell {sample_sym}</code> — Remove sold ticker (no record)",
+            f"• <code>/sell {sample_sym} 5</code> — Trim 5 shares only",
+            f"• <code>/avg {sample_sym} 45.12</code> — Update avg price",
+            f"• <code>/fees {portfolio['brokerage_pct']:g} {portfolio['extra_fee_pct']:g} {portfolio['gst_pct']:g}</code> — Update brok / extra / GST %",
+            "• <code>/toggle</code> — Pause or resume alerts",
+        ])
+
+    if is_admin_user(user):
+        lines.extend([
+            "\n<b>Admin User Management:</b>",
+            "• <code>/users</code> — List all users &amp; roles",
+            "• <code>/allow 123456789 ro Rahul</code> — Shared read-only",
+            "• <code>/allow 123456789 edit Rahul</code> — Shared full edit",
+            "• <code>/allow 123456789 separate Rahul</code> — Separate portfolio",
+            "• <code>/revoke 123456789</code> — Remove user access",
+        ])
+
+    return "\n".join(lines)
 
 
-def is_authorized(update: Update) -> bool:
-    return bool(update.effective_chat and update.effective_chat.id == CHAT_ID)
+async def sync_user_commands(bot, chat_id: int, role: str | None) -> None:
+    """Customizes each user's Telegram Menu button to match their permissions."""
+    try:
+        if role is None:
+            await bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=chat_id))
+            return
+
+        if role == "shared_ro":
+            cmds = [
+                BotCommand("status", "Live shared portfolio P&L"),
+                BotCommand("help", "Show holdings & access info"),
+            ]
+        else:
+            cmds = [
+                BotCommand("status", "Live portfolio P&L & triggers"),
+                BotCommand("add", "Add/set a stock (/add TQQQ 10 75.50)"),
+                BotCommand("buy", "Log a buy (/buy SOXL 100 41.00)"),
+                BotCommand("sell", "Remove sold stock (/sell SOXL)"),
+                BotCommand("avg", "Update avg price (/avg SOXL 45.12)"),
+                BotCommand("fees", "Update brokerage, extra fees & GST"),
+                BotCommand("toggle", "Pause or resume price alerts"),
+                BotCommand("help", "Show all commands & holdings"),
+            ]
+            if role == "admin":
+                cmds.extend([
+                    BotCommand("users", "List authorized users & roles"),
+                    BotCommand("allow", "Add user (/allow <id> ro|edit|separate)"),
+                    BotCommand("revoke", "Remove a user (/revoke <id>)"),
+                ])
+
+        await bot.set_my_commands(cmds, scope=BotCommandScopeChat(chat_id=chat_id))
+    except Exception:
+        pass
 
 
-def fetch_quotes_batch(tickers: list[str], session: str) -> tuple[dict, dict]:
-    quotes = {}
-    errors = {}
-    for idx, sym in enumerate(tickers):
-        if idx > 0:
-            time.sleep(0.25)
-        try:
-            quotes[sym] = fetch_quote_for_session(sym, session)
-        except Exception as e:
-            errors[sym] = str(e)
-    return quotes, errors
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    state, uid, user, portfolio = get_user_context(update)
+    if not uid:
+        return
+    if not user:
+        await update.message.reply_text(
+            f"👋 <b>Access Required</b>\n"
+            f"<blockquote>Your Telegram Chat ID: <code>{uid}</code></blockquote>\n"
+            f"Send this ID to the bot admin so they can grant you shared or personal access.",
+            parse_mode="HTML",
+        )
+        return
+    await status_cmd(update, context)
 
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorized(update):
+    state, uid, user, portfolio = get_user_context(update)
+    if not user or portfolio is None:
         return
-    state = load_state()
-    positions = state["positions"]
+    editable = can_edit(user)
+    positions = portfolio["positions"]
 
     if not positions:
         await update.message.reply_text(
-            format_portfolio_status(state, {}, {}),
+            format_portfolio_status(portfolio, {}, {}, editable),
             parse_mode="HTML",
-            reply_markup=build_status_keyboard(state),
+            reply_markup=build_status_keyboard(portfolio, editable),
         )
         return
 
@@ -582,52 +802,63 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             sym = parse_ticker(context.args[0])
             if sym not in positions:
                 await update.message.reply_text(
-                    f"<code>{html.escape(sym)}</code> is not in your portfolio. Use <code>/add {html.escape(sym)} &lt;shares&gt; &lt;avg&gt;</code>.",
+                    f"<code>{html.escape(sym)}</code> is not in this portfolio.",
                     parse_mode="HTML",
                 )
                 return
             price, qdt, src = await asyncio.to_thread(fetch_quote_for_session, sym, session)
             await update.message.reply_text(
-                format_single_card(sym, price, qdt, positions[sym], state, src, compact=False),
+                format_single_card(sym, price, qdt, positions[sym], portfolio, src, compact=False),
                 parse_mode="HTML",
-                reply_markup=build_status_keyboard(state),
+                reply_markup=build_status_keyboard(portfolio, editable),
             )
             return
 
-        quotes, errors = await asyncio.to_thread(fetch_quotes_batch, list(positions.keys()), session)
+        quotes, errors = await fetch_quotes_batch(list(positions.keys()), session)
         await update.message.reply_text(
-            format_portfolio_status(state, quotes, errors),
+            format_portfolio_status(portfolio, quotes, errors, editable),
             parse_mode="HTML",
-            reply_markup=build_status_keyboard(state),
+            reply_markup=build_status_keyboard(portfolio, editable),
         )
     except Exception as e:
         await update.message.reply_text(f"Error fetching status: {html.escape(str(e))}")
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorized(update):
+    state, uid, user, portfolio = get_user_context(update)
+    if not user or portfolio is None:
         return
-    state = load_state()
     await update.message.reply_text(
-        format_help(state),
+        format_help(user, portfolio),
         parse_mode="HTML",
-        reply_markup=build_help_keyboard(state),
+        reply_markup=build_help_keyboard(portfolio, can_edit(user)),
     )
 
 
+async def require_edit(update: Update, user: dict | None) -> bool:
+    if not user:
+        return False
+    if not can_edit(user):
+        await update.message.reply_text(
+            "🔒 You have <b>read-only</b> access to this shared portfolio.",
+            parse_mode="HTML",
+        )
+        return False
+    return True
+
+
 async def add_or_set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Usage: /add <TICKER> <shares> <avg_price> (or /set <shares> <avg> if only 1 holding)."""
-    if not is_authorized(update):
+    state, uid, user, portfolio = get_user_context(update)
+    if not await require_edit(update, user) or portfolio is None:
         return
     try:
-        state = load_state()
         args = context.args
         if len(args) == 3:
             sym = parse_ticker(args[0])
             shares = parse_positive(args[1], "Shares")
             avg_price = parse_positive(args[2], "Average price")
-        elif len(args) == 2 and len(state["positions"]) == 1:
-            sym = next(iter(state["positions"]))
+        elif len(args) == 2 and len(portfolio["positions"]) == 1:
+            sym = next(iter(portfolio["positions"]))
             shares = parse_positive(args[0], "Shares")
             avg_price = parse_positive(args[1], "Average price")
         else:
@@ -636,8 +867,8 @@ async def add_or_set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 "Example: <code>/add TQQQ 10 75.50</code>"
             )
 
-        is_new = sym not in state["positions"]
-        state["positions"][sym] = {
+        is_new = sym not in portfolio["positions"]
+        portfolio["positions"][sym] = {
             "shares": shares,
             "avg_price": avg_price,
             "last_be_step": None,
@@ -645,27 +876,26 @@ async def add_or_set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         save_state(state)
         action = "Added" if is_new else "Updated"
         await update.message.reply_text(
-            f"✅ <b>{action} {html.escape(sym)}</b>\n{format_breakeven_summary(sym, state)}",
+            f"✅ <b>{action} {html.escape(sym)}</b>\n{format_breakeven_summary(sym, portfolio)}",
             parse_mode="HTML",
-            reply_markup=build_status_keyboard(state),
+            reply_markup=build_status_keyboard(portfolio, True),
         )
     except ValueError as e:
         await update.message.reply_text(str(e), parse_mode="HTML")
 
 
 async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Usage: /buy <TICKER> <usd_spent> <buy_price> (creates ticker automatically if new)."""
-    if not is_authorized(update):
+    state, uid, user, portfolio = get_user_context(update)
+    if not await require_edit(update, user) or portfolio is None:
         return
     try:
-        state = load_state()
         args = context.args
         if len(args) == 3:
             sym = parse_ticker(args[0])
             usd_spent = parse_positive(args[1], "USD spent")
             buy_price = parse_positive(args[2], "Buy price")
-        elif len(args) == 2 and len(state["positions"]) == 1:
-            sym = next(iter(state["positions"]))
+        elif len(args) == 2 and len(portfolio["positions"]) == 1:
+            sym = next(iter(portfolio["positions"]))
             usd_spent = parse_positive(args[0], "USD spent")
             buy_price = parse_positive(args[1], "Buy price")
         else:
@@ -675,8 +905,8 @@ async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
 
         added_shares = usd_spent / buy_price
-        if sym in state["positions"]:
-            pos = state["positions"][sym]
+        if sym in portfolio["positions"]:
+            pos = portfolio["positions"][sym]
             old_cost = pos["shares"] * pos["avg_price"]
             new_shares = pos["shares"] + added_shares
             new_avg = (old_cost + usd_spent) / new_shares
@@ -684,7 +914,7 @@ async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             new_shares = added_shares
             new_avg = buy_price
 
-        state["positions"][sym] = {
+        portfolio["positions"][sym] = {
             "shares": new_shares,
             "avg_price": new_avg,
             "last_be_step": None,
@@ -692,17 +922,17 @@ async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         save_state(state)
         await update.message.reply_text(
             f"✅ <b>Bought <code>${usd_spent:.2f}</code> of {html.escape(sym)} @ <code>${buy_price:.2f}</code></b>\n"
-            f"{format_breakeven_summary(sym, state)}",
+            f"{format_breakeven_summary(sym, portfolio)}",
             parse_mode="HTML",
-            reply_markup=build_status_keyboard(state),
+            reply_markup=build_status_keyboard(portfolio, True),
         )
     except ValueError as e:
         await update.message.reply_text(str(e), parse_mode="HTML")
 
 
 async def sell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Usage: /sell <TICKER> (removes completely, no record) or /sell <TICKER> <shares> (partial)."""
-    if not is_authorized(update):
+    state, uid, user, portfolio = get_user_context(update)
+    if not await require_edit(update, user) or portfolio is None:
         return
     try:
         if len(context.args) not in (1, 2):
@@ -711,37 +941,33 @@ async def sell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "• Sold all (remove completely): <code>/sell SOXL</code>\n"
                 "• Sold partial shares: <code>/sell SOXL 5</code>"
             )
-        state = load_state()
+        pid = user["portfolio_id"]
         sym = parse_ticker(context.args[0])
-        if sym not in state["positions"]:
-            raise ValueError(f"<code>{html.escape(sym)}</code> is not in your portfolio.")
+        if sym not in portfolio["positions"]:
+            raise ValueError(f"<code>{html.escape(sym)}</code> is not in this portfolio.")
 
         if len(context.args) == 1:
-            del state["positions"][sym]
+            remove_position(state, pid, sym)
             save_state(state)
-            RUNTIME["last_alert_sent_at"].pop(sym, None)
-            YF_TICKERS.pop(sym, None)
-            remaining = len(state["positions"])
+            remaining = len(portfolio["positions"])
             note = "All positions cleared — polling paused until you add a ticker." if remaining == 0 else f"Tracking <b>{remaining}</b> remaining holding(s)."
             await update.message.reply_text(
                 f"🗑️ <b>Removed {html.escape(sym)}</b> (no record kept).\n{note}",
                 parse_mode="HTML",
-                reply_markup=build_status_keyboard(state),
+                reply_markup=build_status_keyboard(portfolio, True),
             )
             return
 
         sold_shares = parse_positive(context.args[1], "Shares sold")
-        pos = state["positions"][sym]
+        pos = portfolio["positions"][sym]
         new_shares = pos["shares"] - sold_shares
         if new_shares <= 1e-8:
-            del state["positions"][sym]
+            remove_position(state, pid, sym)
             save_state(state)
-            RUNTIME["last_alert_sent_at"].pop(sym, None)
-            YF_TICKERS.pop(sym, None)
             await update.message.reply_text(
                 f"🗑️ <b>Removed {html.escape(sym)}</b> (position fully closed, no record kept).",
                 parse_mode="HTML",
-                reply_markup=build_status_keyboard(state),
+                reply_markup=build_status_keyboard(portfolio, True),
             )
             return
 
@@ -750,47 +976,47 @@ async def sell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         save_state(state)
         await update.message.reply_text(
             f"✅ <b>Trimmed <code>{sold_shares:g}</code> shares of {html.escape(sym)}</b>\n"
-            f"{format_breakeven_summary(sym, state)}",
+            f"{format_breakeven_summary(sym, portfolio)}",
             parse_mode="HTML",
-            reply_markup=build_status_keyboard(state),
+            reply_markup=build_status_keyboard(portfolio, True),
         )
     except ValueError as e:
         await update.message.reply_text(str(e), parse_mode="HTML")
 
 
 async def avg_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Usage: /avg <TICKER> <avg_price> (or /avg <price> if only 1 holding)."""
-    if not is_authorized(update):
+    state, uid, user, portfolio = get_user_context(update)
+    if not await require_edit(update, user) or portfolio is None:
         return
     try:
-        state = load_state()
         args = context.args
         if len(args) == 2:
             sym = parse_ticker(args[0])
             avg_price = parse_positive(args[1], "Average price")
-        elif len(args) == 1 and len(state["positions"]) == 1:
-            sym = next(iter(state["positions"]))
+        elif len(args) == 1 and len(portfolio["positions"]) == 1:
+            sym = next(iter(portfolio["positions"]))
             avg_price = parse_positive(args[0], "Average price")
         else:
             raise ValueError("Usage: <code>/avg &lt;TICKER&gt; &lt;avg_price&gt;</code>\nExample: <code>/avg SOXL 45.12</code>")
 
-        if sym not in state["positions"]:
+        if sym not in portfolio["positions"]:
             raise ValueError(f"<code>{html.escape(sym)}</code> not found. Use <code>/add {html.escape(sym)} &lt;shares&gt; {avg_price:g}</code>.")
 
-        state["positions"][sym]["avg_price"] = avg_price
-        state["positions"][sym]["last_be_step"] = None
+        portfolio["positions"][sym]["avg_price"] = avg_price
+        portfolio["positions"][sym]["last_be_step"] = None
         save_state(state)
         await update.message.reply_text(
-            f"✅ <b>Average Updated ({html.escape(sym)})</b>\n{format_breakeven_summary(sym, state)}",
+            f"✅ <b>Average Updated ({html.escape(sym)})</b>\n{format_breakeven_summary(sym, portfolio)}",
             parse_mode="HTML",
-            reply_markup=build_status_keyboard(state),
+            reply_markup=build_status_keyboard(portfolio, True),
         )
     except ValueError as e:
         await update.message.reply_text(str(e), parse_mode="HTML")
 
 
 async def fees_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorized(update):
+    state, uid, user, portfolio = get_user_context(update)
+    if not await require_edit(update, user) or portfolio is None:
         return
     try:
         if len(context.args) not in (2, 3):
@@ -799,72 +1025,202 @@ async def fees_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "• Standard: <code>/fees 0.25 0.70 18</code>\n"
                 "• All-in 0.70%: <code>/fees 0 0.70 0</code>"
             )
-        state = load_state()
         brok_pct = parse_pct(context.args[0], "Brokerage %", max_val=50.0)
         extra_pct = parse_pct(context.args[1], "Extra fee %", max_val=100.0)
         gst_pct = (
             parse_pct(context.args[2], "GST %", max_val=100.0, allow_max=True)
             if len(context.args) == 3
-            else state["gst_pct"]
+            else portfolio["gst_pct"]
         )
         if (brok_pct / 100.0) * (1.0 + gst_pct / 100.0) >= 1.0:
             raise ValueError("Combined brokerage + GST cannot be 100% or higher.")
 
-        state["brokerage_pct"] = brok_pct
-        state["extra_fee_pct"] = extra_pct
-        state["gst_pct"] = gst_pct
-        for pos in state["positions"].values():
+        portfolio["brokerage_pct"] = brok_pct
+        portfolio["extra_fee_pct"] = extra_pct
+        portfolio["gst_pct"] = gst_pct
+        for pos in portfolio["positions"].values():
             pos["last_be_step"] = None
         save_state(state)
 
         summary = (
             f"<blockquote><b>Brokerage:</b> <code>{brok_pct:g}%</code>/side + <code>{gst_pct:g}%</code> GST\n"
             f"<b>Extra Fees:</b> <code>{extra_pct:g}%</code>\n"
-            f"<i>All breakeven grids reset to recalculate on next check.</i></blockquote>"
+            f"<i>Breakeven grids reset to recalculate on next check.</i></blockquote>"
         )
         await update.message.reply_text(
             f"✅ <b>Charge Rates Updated</b>\n{summary}",
             parse_mode="HTML",
-            reply_markup=build_status_keyboard(state),
+            reply_markup=build_status_keyboard(portfolio, True),
         )
     except ValueError as e:
         await update.message.reply_text(str(e), parse_mode="HTML")
 
 
 async def toggle_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorized(update):
+    state, uid, user, portfolio = get_user_context(update)
+    if not await require_edit(update, user) or portfolio is None:
         return
-    state = load_state()
-    state["alerts_enabled"] = not state.get("alerts_enabled", True)
+    portfolio["alerts_enabled"] = not portfolio.get("alerts_enabled", True)
     save_state(state)
-    label = "ON 🔔" if state["alerts_enabled"] else "PAUSED 🔕"
+    label = "ON 🔔" if portfolio["alerts_enabled"] else "PAUSED 🔕"
     await update.message.reply_text(
         f"Trigger alerts are now <b>{label}</b>.",
         parse_mode="HTML",
-        reply_markup=build_status_keyboard(state),
+        reply_markup=build_status_keyboard(portfolio, True),
+    )
+
+
+async def allow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin only: /allow <chat_id> <ro|edit|separate> [name]"""
+    state, uid, user, _ = get_user_context(update)
+    if not is_admin_user(user):
+        return
+    try:
+        if len(context.args) < 2:
+            raise ValueError(
+                "Usage: <code>/allow &lt;chat_id&gt; &lt;ro|edit|separate&gt; [name]</code>\n"
+                "• Shared read-only: <code>/allow 123456789 ro Rahul</code>\n"
+                "• Shared edit: <code>/allow 123456789 edit Rahul</code>\n"
+                "• Separate portfolio: <code>/allow 123456789 separate Rahul</code>"
+            )
+        target_id = parse_chat_id(context.args[0])
+        target_key = str(target_id)
+        if target_key == ADMIN_KEY:
+            raise ValueError("Cannot change the Admin user's role.")
+
+        mode_raw = context.args[1].strip().lower()
+        role = ROLE_ALIASES.get(mode_raw)
+        if not role:
+            raise ValueError("Mode must be <code>ro</code>, <code>edit</code>, or <code>separate</code>.")
+
+        label = " ".join(context.args[2:]).strip()[:32]
+        if not label:
+            label = state["users"].get(target_key, {}).get("label") or f"User {target_key[-4:]}"
+
+        if role == "separate":
+            pid = target_key
+            if pid not in state["portfolios"]:
+                state["portfolios"][pid] = make_empty_portfolio()
+        else:
+            pid = ADMIN_KEY
+
+        state["users"][target_key] = {
+            "role": role,
+            "portfolio_id": pid,
+            "label": label,
+        }
+        save_state(state)
+        await sync_user_commands(context.bot, target_id, role)
+
+        # Try notifying the user (succeeds if they already tapped Start)
+        notified = True
+        try:
+            welcome = (
+                f"✅ <b>Access Granted: {html.escape(ROLE_LABELS[role])}</b>\n"
+                f"Send /status to view live prices or /help for available commands."
+            )
+            await context.bot.send_message(chat_id=target_id, text=welcome, parse_mode="HTML")
+        except (Forbidden, BadRequest):
+            notified = False
+
+        status_note = (
+            "User notified."
+            if notified
+            else "Saved — ask them to open the bot and tap <b>Start</b> to receive alerts."
+        )
+        await update.message.reply_text(
+            f"✅ <b>User Saved</b>\n"
+            f"<blockquote><b>Name:</b> {html.escape(label)}\n"
+            f"<b>Chat ID:</b> <code>{target_key}</code>\n"
+            f"<b>Access:</b> {html.escape(ROLE_LABELS[role])}</blockquote>\n"
+            f"<i>{status_note}</i>",
+            parse_mode="HTML",
+        )
+    except ValueError as e:
+        await update.message.reply_text(str(e), parse_mode="HTML")
+
+
+async def revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin only: /revoke <chat_id>"""
+    state, uid, user, _ = get_user_context(update)
+    if not is_admin_user(user):
+        return
+    try:
+        if len(context.args) != 1:
+            raise ValueError("Usage: <code>/revoke &lt;chat_id&gt;</code>")
+        target_id = parse_chat_id(context.args[0])
+        target_key = str(target_id)
+        if target_key == ADMIN_KEY:
+            raise ValueError("Cannot revoke Admin access.")
+        if target_key not in state["users"]:
+            raise ValueError(f"User <code>{target_key}</code> is not in the allowlist.")
+
+        removed = state["users"].pop(target_key)
+        pid = removed["portfolio_id"]
+
+        # Delete separate portfolio if no other user references it
+        still_used = any(u["portfolio_id"] == pid for u in state["users"].values())
+        if pid != ADMIN_KEY and not still_used and pid in state["portfolios"]:
+            del state["portfolios"][pid]
+
+        prune_unused_caches(state)
+        save_state(state)
+        await sync_user_commands(context.bot, target_id, None)
+
+        await update.message.reply_text(
+            f"🗑️ <b>Revoked {html.escape(removed.get('label') or target_key)}</b> (<code>{target_key}</code>).",
+            parse_mode="HTML",
+        )
+    except ValueError as e:
+        await update.message.reply_text(str(e), parse_mode="HTML")
+
+
+async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin only: list all authorized users and roles."""
+    state, uid, user, _ = get_user_context(update)
+    if not is_admin_user(user):
+        return
+
+    rows = []
+    for uid_s, u in state["users"].items():
+        name = html.escape(u.get("label") or uid_s)
+        role_txt = html.escape(ROLE_LABELS.get(u["role"], u["role"]))
+        pf = state["portfolios"].get(u["portfolio_id"], {})
+        count = len(pf.get("positions", {}))
+        rows.append(f"• <b>{name}</b> (<code>{uid_s}</code>) — {role_txt} ({count} ticker{'s' if count != 1 else ''})")
+
+    await update.message.reply_text(
+        f"👥 <b>Authorized Users ({len(rows)})</b>\n"
+        f"<blockquote>" + "\n".join(rows) + "</blockquote>\n"
+        f"Add/change: <code>/allow &lt;id&gt; ro|edit|separate [name]</code>\n"
+        f"Remove: <code>/revoke &lt;id&gt;</code>",
+        parse_mode="HTML",
     )
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorized(update):
-        return
+    state, uid, user, portfolio = get_user_context(update)
     query = update.callback_query
+    if not user or portfolio is None:
+        await query.answer("Access denied.", show_alert=True)
+        return
+
+    editable = can_edit(user)
     action = query.data
 
     if action == "refresh":
         await query.answer("Updating prices...")
         try:
-            state = load_state()
-            positions = state["positions"]
+            positions = portfolio["positions"]
             if positions:
                 session = await asyncio.to_thread(get_market_session)
-                quotes, errors = await asyncio.to_thread(fetch_quotes_batch, list(positions.keys()), session)
+                quotes, errors = await fetch_quotes_batch(list(positions.keys()), session)
             else:
                 quotes, errors = {}, {}
             await query.edit_message_text(
-                format_portfolio_status(state, quotes, errors),
+                format_portfolio_status(portfolio, quotes, errors, editable),
                 parse_mode="HTML",
-                reply_markup=build_status_keyboard(state),
+                reply_markup=build_status_keyboard(portfolio, editable),
             )
         except BadRequest as e:
             if "not modified" not in str(e).lower():
@@ -873,12 +1229,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await query.answer(f"Fetch failed: {e}", show_alert=True)
 
     elif action in ("toggle_status", "toggle_help"):
-        state = load_state()
-        state["alerts_enabled"] = not state.get("alerts_enabled", True)
+        if not editable:
+            await query.answer("Read-only access — cannot toggle alerts.", show_alert=True)
+            kb = build_status_keyboard(portfolio, False) if action == "toggle_status" else build_help_keyboard(portfolio, False)
+            try:
+                await query.edit_message_reply_markup(reply_markup=kb)
+            except BadRequest:
+                pass
+            return
+
+        portfolio["alerts_enabled"] = not portfolio.get("alerts_enabled", True)
         save_state(state)
-        label = "Alerts ON 🔔" if state["alerts_enabled"] else "Alerts PAUSED 🔕"
+        label = "Alerts ON 🔔" if portfolio["alerts_enabled"] else "Alerts PAUSED 🔕"
         await query.answer(label)
-        kb = build_status_keyboard(state) if action == "toggle_status" else build_help_keyboard(state)
+        kb = build_status_keyboard(portfolio, True) if action == "toggle_status" else build_help_keyboard(portfolio, True)
         try:
             await query.edit_message_reply_markup(reply_markup=kb)
         except BadRequest:
@@ -886,12 +1250,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     elif action == "help":
         await query.answer()
-        state = load_state()
         try:
             await query.edit_message_text(
-                format_help(state),
+                format_help(user, portfolio),
                 parse_mode="HTML",
-                reply_markup=build_help_keyboard(state),
+                reply_markup=build_help_keyboard(portfolio, editable),
             )
         except BadRequest:
             pass
@@ -899,7 +1262,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def scheduled_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     state = load_state()
-    if not state.get("alerts_enabled", True) or not state["positions"]:
+
+    # Only poll portfolios referenced by at least one active user
+    referenced_pids = {u["portfolio_id"] for u in state["users"].values()}
+    active_pids = [
+        pid for pid in referenced_pids
+        if pid in state["portfolios"]
+        and state["portfolios"][pid].get("alerts_enabled", True)
+        and state["portfolios"][pid]["positions"]
+    ]
+    if not active_pids:
         return
 
     session = await asyncio.to_thread(get_market_session)
@@ -919,10 +1291,15 @@ async def scheduled_check(context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         RUNTIME["last_extended_check"] = now
 
-    tickers = list(state["positions"].keys())
-    fetched: dict[str, tuple[float, datetime, str]] = {}
+    # Deduplicate tickers across all active portfolios (1 API call per unique ticker)
+    unique_tickers = sorted({
+        sym
+        for pid in active_pids
+        for sym in state["portfolios"][pid]["positions"]
+    })
 
-    for idx, sym in enumerate(tickers):
+    fetched: dict[str, tuple[float, datetime, str]] = {}
+    for idx, sym in enumerate(unique_tickers):
         if idx > 0:
             await asyncio.sleep(0.25)
         try:
@@ -941,106 +1318,124 @@ async def scheduled_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not fetched:
         return
 
-    # Re-read state after async network calls to avoid clobbering concurrent /sell or /toggle
+    # Re-read state after async network calls to avoid overwriting concurrent user commands
     state = load_state()
-    if not state.get("alerts_enabled", True):
-        return
-
     state_dirty = False
-    outbound_messages: list[str] = []
+    deliveries: list[tuple[str, str]] = []  # (portfolio_id, message_html)
 
-    for sym, (price, quote_dt, source) in fetched.items():
-        if sym not in state["positions"]:
-            continue
-        if is_quote_stale(quote_dt):
-            print(f"[{sym}] Skipping stale {source} quote from {quote_dt.isoformat()}.")
+    for pid in active_pids:
+        pf = state["portfolios"].get(pid)
+        if not pf or not pf.get("alerts_enabled", True):
             continue
 
-        pos = state["positions"][sym]
-        m = calculate_metrics(price, pos, state)
-        true_be = m["true_be"]
-        pct_from_be = m["pct_from_be"]
-        last_step = pos.get("last_be_step")
-
-        if last_step is None:
-            current_step = int(round(pct_from_be / MOVE_PCT))
-            pos["last_be_step"] = current_step
-            state_dirty = True
-            down_step = current_step - 1
-            up_step = current_step + 1
-            outbound_messages.append(
-                f"📌 <b>{html.escape(sym)} Grid Armed</b> <i>({html.escape(source)})</i>\n"
-                f"<blockquote><b>Price:</b> <code>${price:.2f}</code> (<code>{pct_from_be:+.2f}%</code> vs <code>${true_be:.2f}</code> BE)\n"
-                f"📉 <code>${step_price(true_be, down_step):.2f}</code> (<code>{step_label(down_step)}</code>)  |  "
-                f"📈 <code>${step_price(true_be, up_step):.2f}</code> (<code>{step_label(up_step)}</code>)</blockquote>"
-            )
-            continue
-
-        eps = 1e-9
-        new_step = None
-        if pct_from_be >= (last_step + 1) * MOVE_PCT - eps:
-            new_step = math.floor((pct_from_be + eps) / MOVE_PCT)
-        elif pct_from_be <= (last_step - 1) * MOVE_PCT + eps:
-            new_step = math.ceil((pct_from_be - eps) / MOVE_PCT)
-
-        if new_step is not None and new_step != last_step:
-            last_sent = RUNTIME["last_alert_sent_at"].get(sym, 0.0)
-            if (
-                ALERT_COOLDOWN_MINUTES > 0
-                and new_step != 0
-                and (now - last_sent) < ALERT_COOLDOWN_MINUTES * 60
-            ):
+        for sym, (price, quote_dt, source) in fetched.items():
+            if sym not in pf["positions"]:
+                continue
+            if is_quote_stale(quote_dt):
+                print(f"[{sym}] Skipping stale {source} quote from {quote_dt.isoformat()}.")
                 continue
 
-            direction = "up" if new_step > last_step else "down"
-            pos["last_be_step"] = new_step
-            state_dirty = True
-            RUNTIME["last_alert_sent_at"][sym] = now
+            pos = pf["positions"][sym]
+            m = calculate_metrics(price, pos, pf)
+            true_be = m["true_be"]
+            pct_from_be = m["pct_from_be"]
+            last_step = pos.get("last_be_step")
 
-            if new_step == 0:
-                header = (
-                    f"🎯 <b>{html.escape(sym)} True Breakeven Reached</b> (<code>${true_be:.2f}</code>)"
-                    if direction == "up"
-                    else f"⚠️ <b>{html.escape(sym)} Back to True Breakeven</b> (<code>${true_be:.2f}</code>)"
-                )
-            elif direction == "up":
-                header = f"📈 <b>{html.escape(sym)} Crossed <code>{step_label(new_step)}</code> from BE</b>"
-            else:
-                header = f"📉 <b>{html.escape(sym)} Dropped to <code>{step_label(new_step)}</code> from BE</b>"
+            if last_step is None:
+                current_step = int(round(pct_from_be / MOVE_PCT))
+                pos["last_be_step"] = current_step
+                state_dirty = True
+                down_step = current_step - 1
+                up_step = current_step + 1
+                deliveries.append((
+                    pid,
+                    f"📌 <b>{html.escape(sym)} Grid Armed</b> <i>({html.escape(source)})</i>\n"
+                    f"<blockquote><b>Price:</b> <code>${price:.2f}</code> (<code>{pct_from_be:+.2f}%</code> vs <code>${true_be:.2f}</code> BE)\n"
+                    f"📉 <code>${step_price(true_be, down_step):.2f}</code> (<code>{step_label(down_step)}</code>)  |  "
+                    f"📈 <code>${step_price(true_be, up_step):.2f}</code> (<code>{step_label(up_step)}</code>)</blockquote>",
+                ))
+                continue
 
-            outbound_messages.append(
-                format_single_card(sym, price, quote_dt, pos, state, source, compact=True, header=header)
-            )
+            eps = 1e-9
+            new_step = None
+            if pct_from_be >= (last_step + 1) * MOVE_PCT - eps:
+                new_step = math.floor((pct_from_be + eps) / MOVE_PCT)
+            elif pct_from_be <= (last_step - 1) * MOVE_PCT + eps:
+                new_step = math.ceil((pct_from_be - eps) / MOVE_PCT)
+
+            if new_step is not None and new_step != last_step:
+                cooldown_key = (pid, sym)
+                last_sent = RUNTIME["last_alert_sent_at"].get(cooldown_key, 0.0)
+                if (
+                    ALERT_COOLDOWN_MINUTES > 0
+                    and new_step != 0
+                    and (now - last_sent) < ALERT_COOLDOWN_MINUTES * 60
+                ):
+                    continue
+
+                direction = "up" if new_step > last_step else "down"
+                pos["last_be_step"] = new_step
+                state_dirty = True
+                RUNTIME["last_alert_sent_at"][cooldown_key] = now
+
+                if new_step == 0:
+                    header = (
+                        f"🎯 <b>{html.escape(sym)} True Breakeven Reached</b> (<code>${true_be:.2f}</code>)"
+                        if direction == "up"
+                        else f"⚠️ <b>{html.escape(sym)} Back to True Breakeven</b> (<code>${true_be:.2f}</code>)"
+                    )
+                elif direction == "up":
+                    header = f"📈 <b>{html.escape(sym)} Crossed <code>{step_label(new_step)}</code> from BE</b>"
+                else:
+                    header = f"📉 <b>{html.escape(sym)} Dropped to <code>{step_label(new_step)}</code> from BE</b>"
+
+                deliveries.append((
+                    pid,
+                    format_single_card(sym, price, quote_dt, pos, pf, source, compact=True, header=header),
+                ))
 
     if state_dirty:
         save_state(state)
 
-    kb = build_status_keyboard(state)
-    for text in outbound_messages:
-        await context.bot.send_message(
-            chat_id=CHAT_ID,
-            text=text,
-            parse_mode="HTML",
-            reply_markup=kb,
-        )
+    for pid, text in deliveries:
+        pf = state["portfolios"].get(pid)
+        if not pf:
+            continue
+        recipients = [
+            (int(uid_s), u)
+            for uid_s, u in state["users"].items()
+            if u["portfolio_id"] == pid
+        ]
+        for target_chat_id, u in recipients:
+            try:
+                await context.bot.send_message(
+                    chat_id=target_chat_id,
+                    text=text,
+                    parse_mode="HTML",
+                    reply_markup=build_status_keyboard(pf, can_edit(u)),
+                )
+            except Exception as e:
+                print(f"Failed sending alert to {target_chat_id}: {e}")
 
 
 async def post_init(app: Application) -> None:
-    await app.bot.set_my_commands([
-        BotCommand("status", "Live portfolio P&L & triggers"),
-        BotCommand("add", "Add/set a stock (/add TQQQ 10 75.50)"),
-        BotCommand("buy", "Log a buy (/buy SOXL 100 41.00)"),
-        BotCommand("sell", "Remove sold stock (/sell SOXL)"),
-        BotCommand("avg", "Update avg price (/avg SOXL 45.12)"),
-        BotCommand("fees", "Update brokerage, extra fees & GST"),
-        BotCommand("toggle", "Pause or resume price alerts"),
-        BotCommand("help", "Show all commands & holdings"),
-    ])
+    await app.bot.set_my_commands(
+        [
+            BotCommand("start", "Start & view your Chat ID / portfolio"),
+            BotCommand("status", "Live portfolio P&L & triggers"),
+            BotCommand("help", "Show available commands"),
+        ],
+        scope=BotCommandScopeDefault(),
+    )
+    state = load_state()
+    for uid_s, u in state["users"].items():
+        await sync_user_commands(app.bot, int(uid_s), u["role"])
 
 
 def main() -> None:
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-    app.add_handler(CommandHandler(["start", "status"], status_cmd))
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler(["add", "set"], add_or_set_cmd))
     app.add_handler(CommandHandler("buy", buy_cmd))
@@ -1048,11 +1443,14 @@ def main() -> None:
     app.add_handler(CommandHandler("avg", avg_cmd))
     app.add_handler(CommandHandler("fees", fees_cmd))
     app.add_handler(CommandHandler("toggle", toggle_cmd))
+    app.add_handler(CommandHandler(["allow", "adduser"], allow_cmd))
+    app.add_handler(CommandHandler(["revoke", "deluser"], revoke_cmd))
+    app.add_handler(CommandHandler("users", users_cmd))
     app.add_handler(CallbackQueryHandler(button_handler))
 
     app.job_queue.run_repeating(scheduled_check, interval=60, first=10)
     print(
-        f"Portfolio hybrid bot started "
+        f"Multi-user portfolio bot started "
         f"(Finnhub every {REGULAR_MINUTES}m regular | Yahoo every {EXTENDED_MINUTES}m extended | "
         f"grid ±{MOVE_PCT:g}% from True BE | cooldown {ALERT_COOLDOWN_MINUTES:g}m)..."
     )
