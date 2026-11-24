@@ -3,6 +3,7 @@ import html
 import json
 import math
 import os
+import re
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -17,7 +18,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = int(os.environ["CHAT_ID"])
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "").strip()
 
-TICKER = os.environ.get("TICKER", "SOXL")
+DEFAULT_TICKER = os.environ.get("TICKER", "SOXL").strip().upper()
 REGULAR_MINUTES = int(os.environ.get("REGULAR_MINUTES", "1"))
 EXTENDED_MINUTES = int(os.environ.get("EXTENDED_MINUTES", "3"))
 MOVE_PCT = float(os.environ.get("MOVE_PCT", "1.0"))
@@ -33,29 +34,41 @@ YF_COOLDOWN_MINUTES = 15
 MARKET_STATUS_CACHE_SECONDS = 300
 
 NY_TZ = ZoneInfo("America/New_York")
-DATA_DIR = "/app/data"
+DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 STATE_FILE = os.path.join(DATA_DIR, "position.json")
 
+TICKER_RE = re.compile(r"^[A-Z0-9.\-^]{1,12}$")
+
 DEFAULT_STATE = {
-    "shares": 13.32899018,
-    "avg_price": 45.82,
     "brokerage_pct": DEFAULT_BROKERAGE_PCT,
     "gst_pct": DEFAULT_GST_PCT,
     "extra_fee_pct": DEFAULT_EXTRA_FEE_PCT,
     "alerts_enabled": True,
-    "last_be_step": None,
+    "positions": {
+        DEFAULT_TICKER: {
+            "shares": 13.32899018,
+            "avg_price": 45.82,
+            "last_be_step": None,
+        }
+    },
 }
 
-YF_TICKER = yf.Ticker(TICKER)
+YF_TICKERS: dict[str, yf.Ticker] = {}
 RUNTIME = {
     "last_regular_check": 0.0,
     "last_extended_check": 0.0,
     "yf_cooldown_until": 0.0,
-    "last_alert_sent_at": 0.0,
+    "last_alert_sent_at": {},
     "market_status_checked_at": 0.0,
     "cached_session": "closed",
 }
+
+
+def get_yf_ticker(symbol: str) -> yf.Ticker:
+    if symbol not in YF_TICKERS:
+        YF_TICKERS[symbol] = yf.Ticker(symbol)
+    return YF_TICKERS[symbol]
 
 
 def fallback_market_session() -> str:
@@ -108,17 +121,58 @@ def get_market_session() -> str:
 
 
 def load_state() -> dict:
+    """Loads position.json and automatically migrates legacy single-ticker state."""
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r") as f:
                 data = json.load(f)
-            merged = DEFAULT_STATE.copy()
-            merged.update(data)
-            return merged
+
+            # Migrate old flat single-ticker format -> multi-ticker format
+            if "positions" not in data:
+                migrated = {
+                    "brokerage_pct": float(data.get("brokerage_pct", DEFAULT_BROKERAGE_PCT)),
+                    "gst_pct": float(data.get("gst_pct", DEFAULT_GST_PCT)),
+                    "extra_fee_pct": float(data.get("extra_fee_pct", DEFAULT_EXTRA_FEE_PCT)),
+                    "alerts_enabled": bool(data.get("alerts_enabled", True)),
+                    "positions": {},
+                }
+                shares = float(data.get("shares", 0))
+                avg_price = float(data.get("avg_price", 0))
+                if shares > 0 and avg_price > 0:
+                    migrated["positions"][DEFAULT_TICKER] = {
+                        "shares": shares,
+                        "avg_price": avg_price,
+                        "last_be_step": data.get("last_be_step"),
+                    }
+                save_state(migrated)
+                print(f"Migrated legacy position.json to multi-ticker format ({list(migrated['positions'].keys())}).")
+                return migrated
+
+            state = {
+                "brokerage_pct": float(data.get("brokerage_pct", DEFAULT_BROKERAGE_PCT)),
+                "gst_pct": float(data.get("gst_pct", DEFAULT_GST_PCT)),
+                "extra_fee_pct": float(data.get("extra_fee_pct", DEFAULT_EXTRA_FEE_PCT)),
+                "alerts_enabled": bool(data.get("alerts_enabled", True)),
+                "positions": {},
+            }
+            for sym, pos in (data.get("positions") or {}).items():
+                if not isinstance(pos, dict):
+                    continue
+                s = float(pos.get("shares", 0))
+                a = float(pos.get("avg_price", 0))
+                if s > 0 and a > 0:
+                    state["positions"][sym.upper()] = {
+                        "shares": s,
+                        "avg_price": a,
+                        "last_be_step": pos.get("last_be_step"),
+                    }
+            return state
         except Exception as e:
             print(f"Failed to read {STATE_FILE} ({e}); falling back to defaults.")
-    save_state(DEFAULT_STATE)
-    return DEFAULT_STATE.copy()
+
+    fresh = json.loads(json.dumps(DEFAULT_STATE))
+    save_state(fresh)
+    return fresh
 
 
 def save_state(state: dict) -> None:
@@ -134,6 +188,13 @@ def save_state(state: dict) -> None:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
         raise
+
+
+def parse_ticker(raw: str) -> str:
+    sym = raw.strip().lstrip("$").upper()
+    if not TICKER_RE.match(sym):
+        raise ValueError(f"Invalid ticker symbol: <code>{html.escape(raw)}</code>")
+    return sym
 
 
 def parse_positive(raw: str, label: str) -> float:
@@ -158,6 +219,11 @@ def fmt_signed_usd(val: float) -> str:
     return f"{'+' if val >= 0 else '-'}${abs(val):.2f}"
 
 
+def is_rate_limit_error(err: Exception) -> bool:
+    msg = str(err).lower()
+    return "429" in msg or "rate" in msg or "too many requests" in msg
+
+
 def fetch_finnhub_quote(ticker: str) -> tuple[float, datetime]:
     if not FINNHUB_API_KEY:
         raise ValueError("FINNHUB_API_KEY not configured")
@@ -171,7 +237,7 @@ def fetch_finnhub_quote(ticker: str) -> tuple[float, datetime]:
     data = resp.json()
     price = float(data.get("c", 0))
     if not math.isfinite(price) or price <= 0:
-        raise ValueError(f"Invalid Finnhub quote response: {data}")
+        raise ValueError(f"No valid Finnhub quote for {ticker}")
     ts_raw = data.get("t")
     quote_dt = (
         datetime.fromtimestamp(int(ts_raw), tz=NY_TZ)
@@ -181,9 +247,10 @@ def fetch_finnhub_quote(ticker: str) -> tuple[float, datetime]:
     return price, quote_dt
 
 
-def fetch_yahoo_quote() -> tuple[float, datetime]:
+def fetch_yahoo_quote(ticker: str) -> tuple[float, datetime]:
+    t = get_yf_ticker(ticker)
     for period in ("1d", "5d"):
-        df = YF_TICKER.history(period=period, interval="1m", prepost=True)
+        df = t.history(period=period, interval="1m", prepost=True)
         if not df.empty:
             closes = df["Close"].dropna()
             if not closes.empty:
@@ -192,27 +259,27 @@ def fetch_yahoo_quote() -> tuple[float, datetime]:
                 if raw_ts.tzinfo is None:
                     raw_ts = raw_ts.replace(tzinfo=timezone.utc)
                 return price, raw_ts.astimezone(NY_TZ)
-    raise ValueError("No Yahoo Finance price data returned.")
+    raise ValueError(f"No Yahoo Finance data for {ticker}")
 
 
-def fetch_quote_for_session(session: str) -> tuple[float, datetime, str]:
+def fetch_quote_for_session(ticker: str, session: str) -> tuple[float, datetime, str]:
     if session == "regular":
         try:
-            price, qdt = fetch_finnhub_quote(TICKER)
+            price, qdt = fetch_finnhub_quote(ticker)
             return price, qdt, "Finnhub"
         except Exception as e:
-            print(f"Finnhub failed ({e}); falling back to Yahoo Finance...")
-            price, qdt = fetch_yahoo_quote()
+            print(f"[{ticker}] Finnhub failed ({e}); falling back to Yahoo Finance...")
+            price, qdt = fetch_yahoo_quote(ticker)
             return price, qdt, "Yahoo (Fallback)"
 
     yahoo_label = "Yahoo Extended" if session == "extended" else "Yahoo (Closed)"
     try:
-        price, qdt = fetch_yahoo_quote()
+        price, qdt = fetch_yahoo_quote(ticker)
         return price, qdt, yahoo_label
     except Exception as e:
         if FINNHUB_API_KEY:
-            print(f"Yahoo failed ({e}); falling back to Finnhub...")
-            price, qdt = fetch_finnhub_quote(TICKER)
+            print(f"[{ticker}] Yahoo failed ({e}); falling back to Finnhub...")
+            price, qdt = fetch_finnhub_quote(ticker)
             fb_label = "Finnhub (Fallback)" if session == "extended" else "Finnhub (Closed)"
             return price, qdt, fb_label
         raise
@@ -223,9 +290,9 @@ def is_quote_stale(quote_dt: datetime) -> bool:
     return age_seconds > STALE_QUOTE_MINUTES * 60
 
 
-def calculate_metrics(price: float, state: dict) -> dict:
-    shares = state["shares"]
-    avg = state["avg_price"]
+def calculate_metrics(price: float, pos: dict, state: dict) -> dict:
+    shares = pos["shares"]
+    avg = pos["avg_price"]
     brok_rate = state["brokerage_pct"] / 100.0
     gst_mult = 1.0 + (state["gst_pct"] / 100.0)
     extra_rate = state["extra_fee_pct"] / 100.0
@@ -260,16 +327,12 @@ def calculate_metrics(price: float, state: dict) -> dict:
     return {
         "invested": invested,
         "current_val": current_val,
-        "buy_brok": buy_brok,
-        "sell_brok": sell_brok,
-        "extra_fee": extra_fee,
         "total_charges": total_charges,
         "gross_pnl": gross_pnl,
         "net_pnl": net_pnl,
         "net_pnl_pct": net_pnl_pct,
         "true_be": true_be,
         "pct_from_be": pct_from_be,
-        "to_pure_profit": true_be - price,
     }
 
 
@@ -302,21 +365,24 @@ def build_help_keyboard(state: dict) -> InlineKeyboardMarkup:
     ])
 
 
-def format_report(
+def format_single_card(
+    ticker: str,
     price: float,
     quote_dt: datetime,
+    pos: dict,
     state: dict,
     source: str,
     compact: bool = False,
     header: str | None = None,
 ) -> str:
-    m = calculate_metrics(price, state)
+    m = calculate_metrics(price, pos, state)
     true_be = m["true_be"]
     icon = "🟢" if m["net_pnl"] >= 0 else "🔴"
     net_str = fmt_signed_usd(m["net_pnl"])
+    safe_sym = html.escape(ticker)
     safe_source = html.escape(source)
 
-    last_step = state.get("last_be_step")
+    last_step = pos.get("last_be_step")
     if last_step is not None and true_be > 0:
         down_p = step_price(true_be, last_step - 1)
         up_p = step_price(true_be, last_step + 1)
@@ -333,7 +399,7 @@ def format_report(
         title = f"{header}\n" if header else ""
         return (
             f"{title}"
-            f"<blockquote>{icon} <b>{TICKER}</b>  <code>${price:.2f}</code>  "
+            f"<blockquote>{icon} <b>{safe_sym}</b>  <code>${price:.2f}</code>  "
             f"(<code>{m['pct_from_be']:+.2f}%</code> vs BE)\n"
             f"<b>Net P&amp;L:</b> <code>{net_str}</code> (<code>{m['net_pnl_pct']:+.2f}%</code>)\n"
             f"<b>BE:</b> <code>${true_be:.2f}</code>{next_short}</blockquote>"
@@ -341,22 +407,102 @@ def format_report(
 
     ts_str = quote_dt.strftime("%b %d, %H:%M ET")
     return (
-        f"{icon} <b>{TICKER}</b>  <code>${price:.2f}</code>\n"
+        f"{icon} <b>{safe_sym}</b>  <code>${price:.2f}</code>\n"
         f"<i>{ts_str} • {safe_source}</i>\n"
         f"<blockquote><b>Net P&amp;L:</b> <code>{net_str}</code> (<code>{m['net_pnl_pct']:+.2f}%</code>)\n"
         f"<b>Value:</b> <code>${m['current_val']:.2f}</code> / <code>${m['invested']:.2f}</code>\n"
-        f"<b>True BE:</b> <code>${true_be:.2f}</code> (<code>{m['pct_from_be']:+.2f}%</code> • Avg <code>${state['avg_price']:.2f}</code>)\n"
+        f"<b>True BE:</b> <code>${true_be:.2f}</code> (<code>{m['pct_from_be']:+.2f}%</code> • Avg <code>${pos['avg_price']:.2f}</code>)\n"
         f"<b>Fees:</b> <code>${m['total_charges']:.2f}</code></blockquote>"
         f"{next_line}"
     )
 
 
-def format_breakeven_summary(state: dict) -> str:
-    m = calculate_metrics(state["avg_price"], state)
+def format_portfolio_status(state: dict, quotes: dict[str, tuple[float, datetime, str]], errors: dict[str, str]) -> str:
+    positions = state["positions"]
+    if not positions:
+        return (
+            "📭 <b>No Active Positions</b>\n"
+            "<blockquote>Add a stock or ETF anytime:\n"
+            "• <code>/add TQQQ 10 75.50</code>\n"
+            "• <code>/buy SOXL 100 41.00</code></blockquote>"
+        )
+
+    # Single holding: show the classic clean single-ticker card
+    if len(positions) == 1:
+        sym, pos = next(iter(positions.items()))
+        if sym in quotes:
+            price, qdt, src = quotes[sym]
+            return format_single_card(sym, price, qdt, pos, state, src, compact=False)
+        return f"⚠️ <b>{html.escape(sym)}</b> fetch failed: {html.escape(errors.get(sym, 'Unknown error'))}"
+
+    # Multiple holdings: portfolio total header + one compact card per ticker
+    total_val = 0.0
+    total_inv = 0.0
+    total_net = 0.0
+    latest_dt = None
+    last_src = ""
+    blocks = []
+
+    for sym, pos in positions.items():
+        safe_sym = html.escape(sym)
+        if sym not in quotes:
+            err = html.escape(errors.get(sym, "Quote unavailable"))
+            blocks.append(f"<blockquote>⚠️ <b>{safe_sym}</b> — {err}</blockquote>")
+            continue
+
+        price, qdt, src = quotes[sym]
+        if latest_dt is None or qdt > latest_dt:
+            latest_dt = qdt
+            last_src = src
+
+        m = calculate_metrics(price, pos, state)
+        total_val += m["current_val"]
+        total_inv += m["invested"]
+        total_net += m["net_pnl"]
+
+        icon = "🟢" if m["net_pnl"] >= 0 else "🔴"
+        net_str = fmt_signed_usd(m["net_pnl"])
+        true_be = m["true_be"]
+
+        last_step = pos.get("last_be_step")
+        if last_step is not None and true_be > 0:
+            down_p = step_price(true_be, last_step - 1)
+            up_p = step_price(true_be, last_step + 1)
+            next_line = (
+                f"\n📉 <code>${down_p:.2f}</code> (<code>{step_label(last_step - 1)}</code>) | "
+                f"📈 <code>${up_p:.2f}</code> (<code>{step_label(last_step + 1)}</code>)"
+            )
+        else:
+            next_line = ""
+
+        blocks.append(
+            f"<blockquote>{icon} <b>{safe_sym}</b>  <code>${price:.2f}</code>  "
+            f"(<code>{m['pct_from_be']:+.2f}%</code> vs BE)\n"
+            f"<b>Net:</b> <code>{net_str}</code> (<code>{m['net_pnl_pct']:+.2f}%</code>) • "
+            f"<b>BE:</b> <code>${true_be:.2f}</code> (Avg <code>${pos['avg_price']:.2f}</code>)"
+            f"{next_line}</blockquote>"
+        )
+
+    tot_pct = (total_net / total_inv) * 100.0 if total_inv > 0 else 0.0
+    tot_icon = "🟢" if total_net >= 0 else "🔴"
+    meta = f"{latest_dt.strftime('%b %d, %H:%M ET')} • {html.escape(last_src)}" if latest_dt else "Unavailable"
+
+    header = (
+        f"{tot_icon} <b>Portfolio ({len(positions)})</b>\n"
+        f"<i>{meta}</i>\n"
+        f"<b>Total Net:</b> <code>{fmt_signed_usd(total_net)}</code> (<code>{tot_pct:+.2f}%</code>) • "
+        f"<b>Val:</b> <code>${total_val:.2f}</code> / <code>${total_inv:.2f}</code>\n"
+    )
+    return header + "\n".join(blocks)
+
+
+def format_breakeven_summary(ticker: str, state: dict) -> str:
+    pos = state["positions"][ticker]
+    m = calculate_metrics(pos["avg_price"], pos, state)
     true_be = m["true_be"]
     return (
-        f"<blockquote><b>Shares:</b> <code>{state['shares']:.8f}</code>  |  "
-        f"<b>Avg:</b> <code>${state['avg_price']:.2f}</code>\n"
+        f"<blockquote><b>Ticker:</b> <code>{html.escape(ticker)}</code>\n"
+        f"<b>Shares:</b> <code>{pos['shares']:.8f}</code>  |  <b>Avg:</b> <code>${pos['avg_price']:.2f}</code>\n"
         f"<b>Fees:</b> <code>${m['total_charges']:.2f}</code> "
         f"(<code>{state['brokerage_pct']:g}%</code> + <code>{state['gst_pct']:g}%</code> GST, "
         f"<code>{state['extra_fee_pct']:g}%</code> extra)\n"
@@ -367,17 +513,33 @@ def format_breakeven_summary(state: dict) -> str:
 
 
 def format_help(state: dict) -> str:
-    m = calculate_metrics(state["avg_price"], state)
+    positions = state["positions"]
+    if positions:
+        holding_lines = []
+        for sym, pos in positions.items():
+            be = calculate_metrics(pos["avg_price"], pos, state)["true_be"]
+            holding_lines.append(
+                f"• <b>{html.escape(sym)}</b>: <code>{pos['shares']:.4f}</code> sh @ "
+                f"<code>${pos['avg_price']:.2f}</code> (BE <code>${be:.2f}</code>)"
+            )
+        holdings_block = "\n".join(holding_lines)
+        sample_sym = next(iter(positions))
+    else:
+        holdings_block = "• <i>None (alerts idle)</i>"
+        sample_sym = "SOXL"
+
     return (
-        f"⚙️ <b>{TICKER} Tracker Settings &amp; Commands</b>\n"
-        f"<blockquote><b>Shares:</b> <code>{state['shares']:.8f}</code>  |  <b>Avg:</b> <code>${state['avg_price']:.2f}</code>\n"
-        f"<b>True BE:</b> <code>${m['true_be']:.2f}</code>  |  <b>Grid:</b> <code>±{MOVE_PCT:g}%</code>\n"
-        f"<b>Charges:</b> <code>{state['brokerage_pct']:g}%</code>/side + <code>{state['gst_pct']:g}%</code> GST + <code>{state['extra_fee_pct']:g}%</code> extra</blockquote>\n"
+        f"⚙️ <b>Portfolio Tracker Settings &amp; Commands</b>\n"
+        f"<blockquote><b>Holdings:</b>\n{holdings_block}\n"
+        f"<b>Grid:</b> <code>±{MOVE_PCT:g}%</code> from BE  |  "
+        f"<b>Charges:</b> <code>{state['brokerage_pct']:g}%</code> + <code>{state['gst_pct']:g}%</code> GST + <code>{state['extra_fee_pct']:g}%</code> extra</blockquote>\n"
         f"<b>Tap any example to copy:</b>\n"
-        f"• <code>/status</code> — Live price, P&amp;L &amp; triggers\n"
-        f"• <code>/avg {state['avg_price']:.2f}</code> — Update average price\n"
-        f"• <code>/buy 50 42.00</code> — Log a new buy (USD &amp; price)\n"
-        f"• <code>/set {state['shares']:.4f} {state['avg_price']:.2f}</code> — Set shares &amp; avg\n"
+        f"• <code>/status</code> — Live portfolio P&amp;L &amp; triggers\n"
+        f"• <code>/add TQQQ 10 75.50</code> — Add a new ticker (or overwrite)\n"
+        f"• <code>/buy {sample_sym} 100 41.00</code> — Log a buy (USD &amp; price)\n"
+        f"• <code>/sell {sample_sym}</code> — Remove sold ticker (no record)\n"
+        f"• <code>/sell {sample_sym} 5</code> — Trim 5 shares only\n"
+        f"• <code>/avg {sample_sym} 45.12</code> — Update avg price\n"
         f"• <code>/fees {state['brokerage_pct']:g} {state['extra_fee_pct']:g} {state['gst_pct']:g}</code> — Update brok / extra / GST %\n"
         f"• <code>/toggle</code> — Pause or resume alerts"
     )
@@ -387,20 +549,59 @@ def is_authorized(update: Update) -> bool:
     return bool(update.effective_chat and update.effective_chat.id == CHAT_ID)
 
 
+def fetch_quotes_batch(tickers: list[str], session: str) -> tuple[dict, dict]:
+    quotes = {}
+    errors = {}
+    for idx, sym in enumerate(tickers):
+        if idx > 0:
+            time.sleep(0.25)
+        try:
+            quotes[sym] = fetch_quote_for_session(sym, session)
+        except Exception as e:
+            errors[sym] = str(e)
+    return quotes, errors
+
+
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
         return
-    try:
-        state = load_state()
-        session = await asyncio.to_thread(get_market_session)
-        price, quote_dt, source = await asyncio.to_thread(fetch_quote_for_session, session)
+    state = load_state()
+    positions = state["positions"]
+
+    if not positions:
         await update.message.reply_text(
-            format_report(price, quote_dt, state, source, compact=False),
+            format_portfolio_status(state, {}, {}),
+            parse_mode="HTML",
+            reply_markup=build_status_keyboard(state),
+        )
+        return
+
+    try:
+        session = await asyncio.to_thread(get_market_session)
+        if context.args:
+            sym = parse_ticker(context.args[0])
+            if sym not in positions:
+                await update.message.reply_text(
+                    f"<code>{html.escape(sym)}</code> is not in your portfolio. Use <code>/add {html.escape(sym)} &lt;shares&gt; &lt;avg&gt;</code>.",
+                    parse_mode="HTML",
+                )
+                return
+            price, qdt, src = await asyncio.to_thread(fetch_quote_for_session, sym, session)
+            await update.message.reply_text(
+                format_single_card(sym, price, qdt, positions[sym], state, src, compact=False),
+                parse_mode="HTML",
+                reply_markup=build_status_keyboard(state),
+            )
+            return
+
+        quotes, errors = await asyncio.to_thread(fetch_quotes_batch, list(positions.keys()), session)
+        await update.message.reply_text(
+            format_portfolio_status(state, quotes, errors),
             parse_mode="HTML",
             reply_markup=build_status_keyboard(state),
         )
     except Exception as e:
-        await update.message.reply_text(f"Error fetching price: {html.escape(str(e))}")
+        await update.message.reply_text(f"Error fetching status: {html.escape(str(e))}")
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -414,41 +615,37 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def avg_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def add_or_set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Usage: /add <TICKER> <shares> <avg_price> (or /set <shares> <avg> if only 1 holding)."""
     if not is_authorized(update):
         return
     try:
-        if len(context.args) != 1:
-            raise ValueError("Usage: <code>/avg 45.82</code>")
-        avg_price = parse_positive(context.args[0], "Average price")
         state = load_state()
-        state["avg_price"] = avg_price
-        state["last_be_step"] = None
-        save_state(state)
-        await update.message.reply_text(
-            f"✅ <b>Average Updated</b>\n{format_breakeven_summary(state)}",
-            parse_mode="HTML",
-            reply_markup=build_status_keyboard(state),
-        )
-    except ValueError as e:
-        await update.message.reply_text(str(e), parse_mode="HTML")
+        args = context.args
+        if len(args) == 3:
+            sym = parse_ticker(args[0])
+            shares = parse_positive(args[1], "Shares")
+            avg_price = parse_positive(args[2], "Average price")
+        elif len(args) == 2 and len(state["positions"]) == 1:
+            sym = next(iter(state["positions"]))
+            shares = parse_positive(args[0], "Shares")
+            avg_price = parse_positive(args[1], "Average price")
+        else:
+            raise ValueError(
+                "Usage: <code>/add &lt;TICKER&gt; &lt;shares&gt; &lt;avg_price&gt;</code>\n"
+                "Example: <code>/add TQQQ 10 75.50</code>"
+            )
 
-
-async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorized(update):
-        return
-    try:
-        if len(context.args) != 2:
-            raise ValueError("Usage: <code>/set 13.32899018 45.82</code>")
-        shares = parse_positive(context.args[0], "Shares")
-        avg_price = parse_positive(context.args[1], "Average price")
-        state = load_state()
-        state["shares"] = shares
-        state["avg_price"] = avg_price
-        state["last_be_step"] = None
+        is_new = sym not in state["positions"]
+        state["positions"][sym] = {
+            "shares": shares,
+            "avg_price": avg_price,
+            "last_be_step": None,
+        }
         save_state(state)
+        action = "Added" if is_new else "Updated"
         await update.message.reply_text(
-            f"✅ <b>Position Updated</b>\n{format_breakeven_summary(state)}",
+            f"✅ <b>{action} {html.escape(sym)}</b>\n{format_breakeven_summary(sym, state)}",
             parse_mode="HTML",
             reply_markup=build_status_keyboard(state),
         )
@@ -457,24 +654,134 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def buy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Usage: /buy <TICKER> <usd_spent> <buy_price> (creates ticker automatically if new)."""
     if not is_authorized(update):
         return
     try:
-        if len(context.args) != 2:
-            raise ValueError("Usage: <code>/buy 50 42.00</code>")
-        usd_spent = parse_positive(context.args[0], "USD spent")
-        buy_price = parse_positive(context.args[1], "Buy price")
         state = load_state()
-        old_cost = state["shares"] * state["avg_price"]
-        new_shares = state["shares"] + (usd_spent / buy_price)
-        new_avg = (old_cost + usd_spent) / new_shares
-        state["shares"] = new_shares
-        state["avg_price"] = new_avg
-        state["last_be_step"] = None
+        args = context.args
+        if len(args) == 3:
+            sym = parse_ticker(args[0])
+            usd_spent = parse_positive(args[1], "USD spent")
+            buy_price = parse_positive(args[2], "Buy price")
+        elif len(args) == 2 and len(state["positions"]) == 1:
+            sym = next(iter(state["positions"]))
+            usd_spent = parse_positive(args[0], "USD spent")
+            buy_price = parse_positive(args[1], "Buy price")
+        else:
+            raise ValueError(
+                "Usage: <code>/buy &lt;TICKER&gt; &lt;usd_spent&gt; &lt;buy_price&gt;</code>\n"
+                "Example: <code>/buy SOXL 100 41.00</code>"
+            )
+
+        added_shares = usd_spent / buy_price
+        if sym in state["positions"]:
+            pos = state["positions"][sym]
+            old_cost = pos["shares"] * pos["avg_price"]
+            new_shares = pos["shares"] + added_shares
+            new_avg = (old_cost + usd_spent) / new_shares
+        else:
+            new_shares = added_shares
+            new_avg = buy_price
+
+        state["positions"][sym] = {
+            "shares": new_shares,
+            "avg_price": new_avg,
+            "last_be_step": None,
+        }
         save_state(state)
         await update.message.reply_text(
-            f"✅ <b>Added <code>${usd_spent:.2f}</code> @ <code>${buy_price:.2f}</code></b>\n"
-            f"{format_breakeven_summary(state)}",
+            f"✅ <b>Bought <code>${usd_spent:.2f}</code> of {html.escape(sym)} @ <code>${buy_price:.2f}</code></b>\n"
+            f"{format_breakeven_summary(sym, state)}",
+            parse_mode="HTML",
+            reply_markup=build_status_keyboard(state),
+        )
+    except ValueError as e:
+        await update.message.reply_text(str(e), parse_mode="HTML")
+
+
+async def sell_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Usage: /sell <TICKER> (removes completely, no record) or /sell <TICKER> <shares> (partial)."""
+    if not is_authorized(update):
+        return
+    try:
+        if len(context.args) not in (1, 2):
+            raise ValueError(
+                "Usage:\n"
+                "• Sold all (remove completely): <code>/sell SOXL</code>\n"
+                "• Sold partial shares: <code>/sell SOXL 5</code>"
+            )
+        state = load_state()
+        sym = parse_ticker(context.args[0])
+        if sym not in state["positions"]:
+            raise ValueError(f"<code>{html.escape(sym)}</code> is not in your portfolio.")
+
+        if len(context.args) == 1:
+            del state["positions"][sym]
+            save_state(state)
+            RUNTIME["last_alert_sent_at"].pop(sym, None)
+            YF_TICKERS.pop(sym, None)
+            remaining = len(state["positions"])
+            note = "All positions cleared — polling paused until you add a ticker." if remaining == 0 else f"Tracking <b>{remaining}</b> remaining holding(s)."
+            await update.message.reply_text(
+                f"🗑️ <b>Removed {html.escape(sym)}</b> (no record kept).\n{note}",
+                parse_mode="HTML",
+                reply_markup=build_status_keyboard(state),
+            )
+            return
+
+        sold_shares = parse_positive(context.args[1], "Shares sold")
+        pos = state["positions"][sym]
+        new_shares = pos["shares"] - sold_shares
+        if new_shares <= 1e-8:
+            del state["positions"][sym]
+            save_state(state)
+            RUNTIME["last_alert_sent_at"].pop(sym, None)
+            YF_TICKERS.pop(sym, None)
+            await update.message.reply_text(
+                f"🗑️ <b>Removed {html.escape(sym)}</b> (position fully closed, no record kept).",
+                parse_mode="HTML",
+                reply_markup=build_status_keyboard(state),
+            )
+            return
+
+        pos["shares"] = new_shares
+        pos["last_be_step"] = None
+        save_state(state)
+        await update.message.reply_text(
+            f"✅ <b>Trimmed <code>{sold_shares:g}</code> shares of {html.escape(sym)}</b>\n"
+            f"{format_breakeven_summary(sym, state)}",
+            parse_mode="HTML",
+            reply_markup=build_status_keyboard(state),
+        )
+    except ValueError as e:
+        await update.message.reply_text(str(e), parse_mode="HTML")
+
+
+async def avg_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Usage: /avg <TICKER> <avg_price> (or /avg <price> if only 1 holding)."""
+    if not is_authorized(update):
+        return
+    try:
+        state = load_state()
+        args = context.args
+        if len(args) == 2:
+            sym = parse_ticker(args[0])
+            avg_price = parse_positive(args[1], "Average price")
+        elif len(args) == 1 and len(state["positions"]) == 1:
+            sym = next(iter(state["positions"]))
+            avg_price = parse_positive(args[0], "Average price")
+        else:
+            raise ValueError("Usage: <code>/avg &lt;TICKER&gt; &lt;avg_price&gt;</code>\nExample: <code>/avg SOXL 45.12</code>")
+
+        if sym not in state["positions"]:
+            raise ValueError(f"<code>{html.escape(sym)}</code> not found. Use <code>/add {html.escape(sym)} &lt;shares&gt; {avg_price:g}</code>.")
+
+        state["positions"][sym]["avg_price"] = avg_price
+        state["positions"][sym]["last_be_step"] = None
+        save_state(state)
+        await update.message.reply_text(
+            f"✅ <b>Average Updated ({html.escape(sym)})</b>\n{format_breakeven_summary(sym, state)}",
             parse_mode="HTML",
             reply_markup=build_status_keyboard(state),
         )
@@ -506,10 +813,17 @@ async def fees_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         state["brokerage_pct"] = brok_pct
         state["extra_fee_pct"] = extra_pct
         state["gst_pct"] = gst_pct
-        state["last_be_step"] = None
+        for pos in state["positions"].values():
+            pos["last_be_step"] = None
         save_state(state)
+
+        summary = (
+            f"<blockquote><b>Brokerage:</b> <code>{brok_pct:g}%</code>/side + <code>{gst_pct:g}%</code> GST\n"
+            f"<b>Extra Fees:</b> <code>{extra_pct:g}%</code>\n"
+            f"<i>All breakeven grids reset to recalculate on next check.</i></blockquote>"
+        )
         await update.message.reply_text(
-            f"✅ <b>Charge Rates Updated</b>\n{format_breakeven_summary(state)}",
+            f"✅ <b>Charge Rates Updated</b>\n{summary}",
             parse_mode="HTML",
             reply_markup=build_status_keyboard(state),
         )
@@ -538,13 +852,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     action = query.data
 
     if action == "refresh":
-        await query.answer("Updating price...")
+        await query.answer("Updating prices...")
         try:
             state = load_state()
-            session = await asyncio.to_thread(get_market_session)
-            price, quote_dt, source = await asyncio.to_thread(fetch_quote_for_session, session)
+            positions = state["positions"]
+            if positions:
+                session = await asyncio.to_thread(get_market_session)
+                quotes, errors = await asyncio.to_thread(fetch_quotes_batch, list(positions.keys()), session)
+            else:
+                quotes, errors = {}, {}
             await query.edit_message_text(
-                format_report(price, quote_dt, state, source, compact=False),
+                format_portfolio_status(state, quotes, errors),
                 parse_mode="HTML",
                 reply_markup=build_status_keyboard(state),
             )
@@ -581,7 +899,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def scheduled_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     state = load_state()
-    if not state.get("alerts_enabled", True):
+    if not state.get("alerts_enabled", True) or not state["positions"]:
         return
 
     session = await asyncio.to_thread(get_market_session)
@@ -594,102 +912,129 @@ async def scheduled_check(context: ContextTypes.DEFAULT_TYPE) -> None:
         if now - RUNTIME["last_regular_check"] < (REGULAR_MINUTES * 60 - 5):
             return
         RUNTIME["last_regular_check"] = now
-        try:
-            price, quote_dt, source = await asyncio.to_thread(fetch_quote_for_session, "regular")
-        except Exception as e:
-            print(f"Regular-hours price check failed: {e}")
-            return
     else:
         if now < RUNTIME["yf_cooldown_until"]:
             return
         if now - RUNTIME["last_extended_check"] < (EXTENDED_MINUTES * 60 - 5):
             return
         RUNTIME["last_extended_check"] = now
-        try:
-            price, quote_dt = await asyncio.to_thread(fetch_yahoo_quote)
-            source = "Yahoo Extended"
-        except Exception as e:
-            RUNTIME["yf_cooldown_until"] = now + (YF_COOLDOWN_MINUTES * 60)
-            print(f"Yahoo extended check failed ({e}); cooling down {YF_COOLDOWN_MINUTES}m.")
-            return
 
-    if is_quote_stale(quote_dt):
-        print(f"Skipping stale {source} quote from {quote_dt.isoformat()}.")
+    tickers = list(state["positions"].keys())
+    fetched: dict[str, tuple[float, datetime, str]] = {}
+
+    for idx, sym in enumerate(tickers):
+        if idx > 0:
+            await asyncio.sleep(0.25)
+        try:
+            if session == "regular":
+                fetched[sym] = await asyncio.to_thread(fetch_quote_for_session, sym, "regular")
+            else:
+                price, qdt = await asyncio.to_thread(fetch_yahoo_quote, sym)
+                fetched[sym] = (price, qdt, "Yahoo Extended")
+        except Exception as e:
+            print(f"[{sym}] {session} check failed: {e}")
+            if session != "regular" and is_rate_limit_error(e):
+                RUNTIME["yf_cooldown_until"] = now + (YF_COOLDOWN_MINUTES * 60)
+                print(f"Yahoo rate-limited; cooling down {YF_COOLDOWN_MINUTES}m.")
+                break
+
+    if not fetched:
         return
 
-    m = calculate_metrics(price, state)
-    true_be = m["true_be"]
-    pct_from_be = m["pct_from_be"]
-    last_step = state.get("last_be_step")
+    # Re-read state after async network calls to avoid clobbering concurrent /sell or /toggle
+    state = load_state()
+    if not state.get("alerts_enabled", True):
+        return
 
-    if last_step is None:
-        current_step = int(round(pct_from_be / MOVE_PCT))
-        state["last_be_step"] = current_step
-        save_state(state)
-        down_step = current_step - 1
-        up_step = current_step + 1
-        await context.bot.send_message(
-            chat_id=CHAT_ID,
-            text=(
-                f"📌 <b>{TICKER} Grid Armed</b> <i>({html.escape(source)})</i>\n"
+    state_dirty = False
+    outbound_messages: list[str] = []
+
+    for sym, (price, quote_dt, source) in fetched.items():
+        if sym not in state["positions"]:
+            continue
+        if is_quote_stale(quote_dt):
+            print(f"[{sym}] Skipping stale {source} quote from {quote_dt.isoformat()}.")
+            continue
+
+        pos = state["positions"][sym]
+        m = calculate_metrics(price, pos, state)
+        true_be = m["true_be"]
+        pct_from_be = m["pct_from_be"]
+        last_step = pos.get("last_be_step")
+
+        if last_step is None:
+            current_step = int(round(pct_from_be / MOVE_PCT))
+            pos["last_be_step"] = current_step
+            state_dirty = True
+            down_step = current_step - 1
+            up_step = current_step + 1
+            outbound_messages.append(
+                f"📌 <b>{html.escape(sym)} Grid Armed</b> <i>({html.escape(source)})</i>\n"
                 f"<blockquote><b>Price:</b> <code>${price:.2f}</code> (<code>{pct_from_be:+.2f}%</code> vs <code>${true_be:.2f}</code> BE)\n"
                 f"📉 <code>${step_price(true_be, down_step):.2f}</code> (<code>{step_label(down_step)}</code>)  |  "
                 f"📈 <code>${step_price(true_be, up_step):.2f}</code> (<code>{step_label(up_step)}</code>)</blockquote>"
-            ),
-            parse_mode="HTML",
-            reply_markup=build_status_keyboard(state),
-        )
-        return
-
-    eps = 1e-9
-    new_step = None
-    if pct_from_be >= (last_step + 1) * MOVE_PCT - eps:
-        new_step = math.floor((pct_from_be + eps) / MOVE_PCT)
-    elif pct_from_be <= (last_step - 1) * MOVE_PCT + eps:
-        new_step = math.ceil((pct_from_be - eps) / MOVE_PCT)
-
-    if new_step is not None and new_step != last_step:
-        if (
-            ALERT_COOLDOWN_MINUTES > 0
-            and new_step != 0
-            and (now - RUNTIME["last_alert_sent_at"]) < ALERT_COOLDOWN_MINUTES * 60
-        ):
-            return
-
-        direction = "up" if new_step > last_step else "down"
-        state["last_be_step"] = new_step
-        save_state(state)
-        RUNTIME["last_alert_sent_at"] = now
-
-        if new_step == 0:
-            header = (
-                f"🎯 <b>True Breakeven Reached</b> (<code>${true_be:.2f}</code>)"
-                if direction == "up"
-                else f"⚠️ <b>Back to True Breakeven</b> (<code>${true_be:.2f}</code>)"
             )
-        elif direction == "up":
-            header = f"📈 <b>Crossed <code>{step_label(new_step)}</code> from BE</b>"
-        else:
-            header = f"📉 <b>Dropped to <code>{step_label(new_step)}</code> from BE</b>"
+            continue
 
+        eps = 1e-9
+        new_step = None
+        if pct_from_be >= (last_step + 1) * MOVE_PCT - eps:
+            new_step = math.floor((pct_from_be + eps) / MOVE_PCT)
+        elif pct_from_be <= (last_step - 1) * MOVE_PCT + eps:
+            new_step = math.ceil((pct_from_be - eps) / MOVE_PCT)
+
+        if new_step is not None and new_step != last_step:
+            last_sent = RUNTIME["last_alert_sent_at"].get(sym, 0.0)
+            if (
+                ALERT_COOLDOWN_MINUTES > 0
+                and new_step != 0
+                and (now - last_sent) < ALERT_COOLDOWN_MINUTES * 60
+            ):
+                continue
+
+            direction = "up" if new_step > last_step else "down"
+            pos["last_be_step"] = new_step
+            state_dirty = True
+            RUNTIME["last_alert_sent_at"][sym] = now
+
+            if new_step == 0:
+                header = (
+                    f"🎯 <b>{html.escape(sym)} True Breakeven Reached</b> (<code>${true_be:.2f}</code>)"
+                    if direction == "up"
+                    else f"⚠️ <b>{html.escape(sym)} Back to True Breakeven</b> (<code>${true_be:.2f}</code>)"
+                )
+            elif direction == "up":
+                header = f"📈 <b>{html.escape(sym)} Crossed <code>{step_label(new_step)}</code> from BE</b>"
+            else:
+                header = f"📉 <b>{html.escape(sym)} Dropped to <code>{step_label(new_step)}</code> from BE</b>"
+
+            outbound_messages.append(
+                format_single_card(sym, price, quote_dt, pos, state, source, compact=True, header=header)
+            )
+
+    if state_dirty:
+        save_state(state)
+
+    kb = build_status_keyboard(state)
+    for text in outbound_messages:
         await context.bot.send_message(
             chat_id=CHAT_ID,
-            text=format_report(price, quote_dt, state, source, compact=True, header=header),
+            text=text,
             parse_mode="HTML",
-            reply_markup=build_status_keyboard(state),
+            reply_markup=kb,
         )
 
 
 async def post_init(app: Application) -> None:
-    """Registers the native Telegram Menu button so commands never need to be memorized."""
     await app.bot.set_my_commands([
-        BotCommand("status", "Live price, P&L & triggers"),
-        BotCommand("avg", "Update avg price (/avg 45.12)"),
-        BotCommand("buy", "Log a new buy (/buy 50 42.00)"),
-        BotCommand("set", "Set shares & avg (/set 15.73 45.12)"),
+        BotCommand("status", "Live portfolio P&L & triggers"),
+        BotCommand("add", "Add/set a stock (/add TQQQ 10 75.50)"),
+        BotCommand("buy", "Log a buy (/buy SOXL 100 41.00)"),
+        BotCommand("sell", "Remove sold stock (/sell SOXL)"),
+        BotCommand("avg", "Update avg price (/avg SOXL 45.12)"),
         BotCommand("fees", "Update brokerage, extra fees & GST"),
         BotCommand("toggle", "Pause or resume price alerts"),
-        BotCommand("help", "Show all commands & current config"),
+        BotCommand("help", "Show all commands & holdings"),
     ])
 
 
@@ -697,16 +1042,17 @@ def main() -> None:
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler(["start", "status"], status_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("avg", avg_cmd))
-    app.add_handler(CommandHandler("set", set_cmd))
+    app.add_handler(CommandHandler(["add", "set"], add_or_set_cmd))
     app.add_handler(CommandHandler("buy", buy_cmd))
+    app.add_handler(CommandHandler(["sell", "remove"], sell_cmd))
+    app.add_handler(CommandHandler("avg", avg_cmd))
     app.add_handler(CommandHandler("fees", fees_cmd))
     app.add_handler(CommandHandler("toggle", toggle_cmd))
     app.add_handler(CallbackQueryHandler(button_handler))
 
     app.job_queue.run_repeating(scheduled_check, interval=60, first=10)
     print(
-        f"{TICKER} hybrid bot started "
+        f"Portfolio hybrid bot started "
         f"(Finnhub every {REGULAR_MINUTES}m regular | Yahoo every {EXTENDED_MINUTES}m extended | "
         f"grid ±{MOVE_PCT:g}% from True BE | cooldown {ALERT_COOLDOWN_MINUTES:g}m)..."
     )
