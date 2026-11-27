@@ -1,28 +1,30 @@
-# Live Stock & Position Alert Telegram Bot
+# Telegram Stocks Tracker (`@assist_stocks_bot`)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED.svg)](https://www.docker.com/)
+[![Telegram Bot](https://img.shields.io/badge/Telegram-%40assist__stocks__bot-26A5E4?logo=telegram)](https://t.me/assist_stocks_bot)
 
-An open-source, self-hostable Python Telegram bot for real-time US equity and ETF price monitoring, automated breakeven calculation, and instant threshold alerts—powered by the Finnhub API and Yahoo Finance (`yfinance`).
+An open-source, self-hostable Python Telegram bot for real-time US equity and ETF price monitoring, automated position breakeven calculations, and instant threshold alerts—powered by the Finnhub API and Yahoo Finance (`yfinance`).
 
-Built to give individual traders reliable, zero-subscription live updates directly in Telegram without relying on paid financial terminals or manual chart watching.
-
----
-
-## Features
-
-- **Real-Time Price Feed:** Streams/polls live market quotes using the Finnhub API with Yahoo Finance (`yfinance`) as a fallback data source.
-- **Breakeven & Position Tracking:** Automatically calculates average entry price, breakeven levels, and live unrealized P&L for active positions (e.g., leveraged ETFs like `SOXL` or any supported ticker).
-- **Custom Price Alerts:** Sends instant Telegram notifications when a ticker crosses configured target prices or percentage thresholds.
-- **Rate-Limit Resilient:** Designed to operate comfortably within free-tier API quotas with clean retry and backoff handling.
-- **Containerized 24/7 Deployment:** Ships ready for Docker and PaaS/VPS orchestrators (such as Coolify or Oracle Cloud VPS) for continuous uptime.
+Built to give individual traders reliable, zero-subscription live market updates directly in Telegram without relying on paid financial terminals or manual chart watching.
 
 ---
 
 ## Live Instance
 
-- **Telegram Bot:** `https://t.me/YourBotUsername` *(replace with your live bot link or public channel)*
+- **Telegram Bot:** [@assist_stocks_bot](https://t.me/assist_stocks_bot)
+- **Repository:** [github.com/omkarghugeinv/telegram-stocks-tracker](https://github.com/omkarghugeinv/telegram-stocks-tracker)
+
+---
+
+## Features
+
+- **Real-Time Price Feed:** Fetches live market quotes via the Finnhub API with Yahoo Finance (`yfinance`) as a secondary/fallback data source.
+- **Breakeven & Position Tracking:** Automatically computes average entry cost, breakeven levels, and live unrealized P&L for active positions (such as leveraged ETFs like `SOXL` or any supported US ticker).
+- **Custom Price Alerts:** Sends instant Telegram notifications when a tracked ticker crosses configured target prices or percentage thresholds.
+- **Rate-Limit Resilient:** Engineered to stay within free-tier API quotas (60 calls/min on Finnhub) with clean retry and backoff handling.
+- **Containerized 24/7 Deployment:** Docker-ready for continuous uptime on any Linux VPS or self-hosted PaaS (such as Coolify or Oracle Cloud).
 
 ---
 
@@ -39,13 +41,11 @@ Built to give individual traders reliable, zero-subscription live updates direct
 
 | Command | Description |
 | :--- | :--- |
-| `/start` | Initialize the bot and verify live connection |
+| `/start` | Initialize `@assist_stocks_bot` and verify live status |
 | `/price <TICKER>` | Fetch the latest live quote, day high/low, and percentage change |
-| `/breakeven` | View current position summary, average cost, and breakeven price |
+| `/breakeven` | View current position summary, average entry price, and breakeven level |
 | `/alert <TICKER> <PRICE>` | Set a live price threshold notification |
 | `/status` | Check active data feed health and uptime |
-
-*(Update this table to match the exact commands implemented in your script.)*
 
 ---
 
@@ -54,13 +54,13 @@ Built to give individual traders reliable, zero-subscription live updates direct
 ### 1. Clone the Repository
 
 ```bash
-git clone [https://github.com/omkarghugeinv/your-repo-name.git](https://github.com/omkarghugeinv/your-repo-name.git)
-cd your-repo-name
+git clone [https://github.com/omkarghugeinv/telegram-stocks-tracker.git](https://github.com/omkarghugeinv/telegram-stocks-tracker.git)
+cd telegram-stocks-tracker
 ```
 
 ### 2. Configure Environment Variables
 
-Create a `.env` file in the project root:
+Create a `.env` file in the project root (never commit your real `.env` file to Git):
 
 ```env
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
@@ -70,7 +70,7 @@ DEFAULT_TICKER=SOXL
 POLL_INTERVAL_SECONDS=15
 ```
 
-### 3. Run with Python (Local)
+### 3. Run Locally with Python
 
 ```bash
 python -m venv venv
@@ -82,26 +82,30 @@ python main.py
 ### 4. Run with Docker (Recommended for 24/7 Hosting)
 
 ```bash
-docker build -t stock-alert-bot .
-docker run -d --name stock-alert-bot --env-file .env --restart unless-stopped stock-alert-bot
+docker build -t telegram-stocks-tracker .
+docker run -d \
+  --name telegram-stocks-tracker \
+  --env-file .env \
+  --restart unless-stopped \
+  telegram-stocks-tracker
 ```
 
 ---
 
 ## Architecture Overview
 
-1. **Data Ingestion Layer:** Fetches live market ticks via Finnhub REST/WebSocket endpoints and falls back to Yahoo Finance when extended metadata is needed.
+1. **Data Ingestion Layer:** Retrieves live market quotes through Finnhub endpoints and falls back to Yahoo Finance when extended ticker metadata is needed.
 2. **Evaluation Engine:** Compares incoming price updates against stored position cost bases and active user alert thresholds.
-3. **Notification Dispatcher:** Pushes formatted updates to Telegram with cooldown throttling to prevent duplicate alert spam.
+3. **Notification Dispatcher:** Pushes formatted alerts directly to Telegram via `@assist_stocks_bot` with cooldown throttling to prevent duplicate spam.
 
 ---
 
 ## Roadmap
 
-- [ ] Persistent WebSocket streaming for sub-second tick updates
-- [ ] Multi-ticker watchlist support per chat
-- [ ] Automated unit and integration test suite (`pytest`)
-- [ ] One-click `docker-compose.yml` deployment template
+- [ ] Persistent Finnhub WebSocket streaming for sub-second tick updates with automatic reconnection
+- [ ] Multi-ticker watchlists per Telegram chat
+- [ ] Automated `pytest` unit and integration test suite with GitHub Actions CI
+- [ ] One-click `docker-compose.yml` self-hosting template
 
 ---
 
@@ -109,16 +113,16 @@ docker run -d --name stock-alert-bot --env-file .env --restart unless-stopped st
 
 Contributions, bug reports, and feature requests are welcome:
 
-1. Fork the repository.
+1. Fork [omkarghugeinv/telegram-stocks-tracker](https://github.com/omkarghugeinv/telegram-stocks-tracker).
 2. Create a feature branch (`git checkout -b feature/your-feature`).
-3. Commit your changes with clear messages.
-4. Open a Pull Request describing the improvement.
+3. Commit your changes with clear, descriptive messages.
+4. Open a Pull Request explaining the improvement.
 
 ---
 
 ## Disclaimer
 
-This software is provided for informational and educational purposes only and does not constitute financial or investment advice. Market data accuracy depends on third-party upstream providers.
+This software is provided for informational and educational purposes only and does not constitute financial or investment advice. Market data accuracy and availability depend on third-party upstream providers.
 
 ---
 
